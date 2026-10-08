@@ -6,6 +6,14 @@
 
 上图为模拟任务示例，首次运行没有预置任务。
 
+## 下载（普通用户）
+
+无需编译或安装。推荐下载 [Windows 64 位便携包](https://github.com/honina0101-boop/Scheduled-shutdown/releases/download/v1.0.0/Evenfall-1.0.0-win-x64.zip)，解压后双击 **Evenfall.exe**。
+
+也可以下载 [单文件 EXE](https://github.com/honina0101-boop/Scheduled-shutdown/releases/download/v1.0.0/Evenfall.exe)（约 1.28 MB），或访问 [版本下载页](https://github.com/honina0101-boop/Scheduled-shutdown/releases/latest)。
+
+GitHub「Code → Download ZIP」和版本页自动提供的「Source code」是源码，普通用户请选择上面的便携包或 EXE。程序目前未做代码签名。
+
 ## 使用
 
 直接运行发布目录的 **Evenfall.exe**，无需安装。首次运行没有任务，默认关闭登录启动和强制关机。
@@ -89,3 +97,14 @@ JSON 使用 MIT 许可；便携构建所含 GCC 运行库适用 GCC Runtime Libr
 ## 许可证
 
 本项目采用 [MIT License](LICENSE)，第三方组件许可见 [THIRD-PARTY-NOTICES.txt](THIRD-PARTY-NOTICES.txt)。
+
+## 发布到 GitHub Releases
+
+先构建、运行模拟验证，再发布已验证的产物。发布脚本通过本机 Git Credential Manager 或 GH_TOKEN / GITHUB_TOKEN 认证，不会输出或保存令牌。Windows 便携包、单文件 EXE、源码 ZIP 和 SHA-256 校验文件会先上传到草稿版本，完整上传后再公开。
+
+~~~powershell
+python scripts/qa.py --build-dir build --exe dist/Evenfall.exe
+python scripts/release.py --reuse-exe
+python scripts/publish_release.py --prepare-only
+python scripts/publish_release.py --target-sha (git rev-parse HEAD)
+~~~
