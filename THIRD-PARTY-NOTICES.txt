@@ -1,0 +1,19 @@
+Evenfall / 晚安 · 定时关机 1.0.0
+
+nlohmann/json 3.12.0
+Copyright (c) 2013-2025 Niels Lohmann.
+MIT License. Full text: licenses/JSON-LICENSE.txt
+Source: https://github.com/nlohmann/json/tree/v3.12.0
+
+Portable GCC builds statically link GCC runtime libraries, subject to GPL 3
+with GCC Runtime Library Exception 3.1.
+Texts: licenses/GPL-3.0.txt and licenses/GCC-RUNTIME-EXCEPTION.txt
+Toolchain: w64devkit 2.10.0, GCC 16.2.0.
+Source: https://github.com/skeeto/w64devkit/tree/v2.10.0
+Compiler tools are not included in the portable application.
+
+MinGW-w64 runtime components:
+Notices: licenses/MINGW-LICENSE.txt
+Source: https://github.com/mingw-w64/mingw-w64
+
+System DLLs and system fonts are provided by Windows.
