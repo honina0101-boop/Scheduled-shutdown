@@ -24,7 +24,7 @@ void configureDpi();
 std::wstring wide(const std::string &utf8);
 std::string utf8(const std::wstring &text);
 std::string newId();
-std::wstring formatTime(Time time, bool date = false);
+std::wstring formatTime(Time time, bool date = false, bool seconds = false);
 std::wstring describe(const Task &task);
 std::wstring describeStatus(Status status);
 std::filesystem::path defaultDataDirectory();
@@ -42,6 +42,7 @@ struct Storage {
 struct PowerResult {
     bool accepted = false;
     std::wstring message;
+    Time requestedAt = 0;
 };
 PowerResult requestShutdown(bool force, bool simulate);
 bool setAutostart(bool enabled, std::wstring &error);

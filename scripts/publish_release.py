@@ -14,7 +14,7 @@ import zipfile
 
 ROOT = Path(__file__).resolve().parents[1]
 REPOSITORY = "honina0101-boop/Scheduled-shutdown"
-VERSION = "1.0.0"
+VERSION = "1.0.1"
 TAG = "v" + VERSION
 API = "https://api.github.com/repos/" + REPOSITORY
 
@@ -23,8 +23,8 @@ def digest(path):
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-def prepare():
-    dist = ROOT / "dist"
+def prepare(directory="dist"):
+    dist = ROOT / directory
     checks = json.loads((dist / "CHECKSUMS.json").read_text(encoding="utf-8"))
     for name, item in checks.items():
         file = dist / name
@@ -88,26 +88,37 @@ def request(token, method, url, value=None, raw=None, content_type=None):
 
 def publish(assets, target):
     token = credential()
-    body = """## 下载与使用
+    report = json.loads((ROOT / "build/qa/report.json").read_text(encoding="utf-8"))
+    total = report["scheduler"]["assertions"] + report["persistence_platform"]["assertions"] + report["ui"]["checks"] + report["instance_lock"]["checks"]
+    body = r"""## 下载与使用
 
-推荐下载 **Evenfall-1.0.0-win-x64.zip**，解压后双击 **Evenfall.exe**。免安装，无需另装运行库，适用于 Windows 10/11 64 位。
+推荐下载 **Evenfall-1.0.1-win-x64.zip**，解压后双击 **Evenfall.exe**。免安装，无需另装运行库，适用于 Windows 10/11 64 位。
 
-也可以直接下载 **Evenfall.exe**（约 1.28 MB）。第一次运行没有预置任务，请自行创建。
+也可以直接下载 **Evenfall.exe**（小于 5 MB）。第一次运行没有预置任务，请自行创建。
 
 GitHub 自动附带的 Source code (zip / tar.gz) 是源码，不是可运行程序。
 
-## 功能
+## 1.0.1 修复
 
-- 执行一次、按星期重复、快速倒计时；支持多个任务。
-- 提前 60 秒提醒，可取消本次或推迟 10 / 30 / 60 分钟；重复计划继续保留。
-- 托盘常驻、暂停恢复、登录自启动、浅色／深色主题及执行记录。
+- 关机请求同时检查倒计时与系统时间，避免午夜前几毫秒提前提交；正常提醒保持原定时间。
+- 记录区区分原计划、本次目标、实际请求时间（到秒）；保留旧日志原始事实。
+- 停用持续有效，清除提醒和推迟项；提交前复核启用状态、任务版本、存在性及暂停状态。补充开关操作记录，并防止旧编辑草稿重新启用任务。
+- 数据目录采用跨会话独占文件锁，阻止计划任务后台副本与桌面副本同时调度；锁定失败时不启动调度。
+- 推迟 10／30／60 分钟选项在提醒卡片内部展开，支持 Tab、Enter、Esc，消除独立弹出菜单被遮挡的路径。
+- 新增开发交接记录及午夜、停用、旧数据迁移回归测试。
+
+本机已发现后台会话与桌面会话重复运行条件；旧版会话内互斥量无法拦截。历史日志没有进程标识，无法追溯哪一个副本提交了某次请求。菜单遮挡的原始操作路径未复现，本次移除了独立弹出菜单。
+
+## 升级
+
+先停止运行旧版的 Windows 计划任务并从托盘退出旧版，确认所有旧进程退出后复制备份 `%LOCALAPPDATA%\Evenfall`，再替换 EXE。新版读取旧数据并保存为 schemaVersion 2；回退 1.0.0 时须恢复升级前备份。建议仅使用程序内的登录自启动，避免另设非交互式计划任务；新版与旧版混用时，旧版不会遵守新增文件锁。取消本次不等于停用：前一天 23:59 取消紧接着的 00:00 后，再下一天 00:00 继续。
 
 ## 验证
 
-115 项模拟检查通过。Windows 10 已完成本地验证；实际关机、Windows 11、真实登录启动、睡眠恢复和多个物理显示器尚待专用环境验证。本版本未做代码签名。
+{total} 项模拟检查通过。Windows 10 已完成本地验证；实际关机、Windows 11、真实登录启动、睡眠恢复和多个物理显示器尚待专用环境验证。本版本未做代码签名。
 
 校验值见 SHA256SUMS.txt；使用说明和许可证包含在推荐的便携 ZIP 中。
-"""
+""".replace("{total}", str(total))
     try:
         release = request(token, "GET", API + "/releases/tags/" + TAG)
     except urllib.error.HTTPError as error:
@@ -145,10 +156,11 @@ GitHub 自动附带的 Source code (zip / tar.gz) 是源码，不是可运行程
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--prepare-only", action="store_true")
+    parser.add_argument("--dist-dir", default="dist")
     parser.add_argument("--target-sha", help="Full verified commit SHA for the release tag")
     args = parser.parse_args()
     try:
-        assets = prepare()
+        assets = prepare(args.dist_dir)
         if args.prepare_only:
             print("Verified release assets: " + ", ".join(file.name for file in assets))
         else:

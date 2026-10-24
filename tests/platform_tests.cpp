@@ -1,3 +1,4 @@
+#include "../third_party/json.hpp"
 #include "platform.hpp"
 #include <fstream>
 #include <iostream>
@@ -90,6 +91,59 @@ int main() {
         check(!upperLoaded.recovered && upperLoaded.state.tasks.size() == 1 &&
                   upperLoaded.state.tasks.front().day == distant.day,
               "upper date round-trip");
+        Storage switches(path / L"switches");
+        Engine midnight(calendar);
+        Task daily;
+        daily.id = "midnight";
+        daily.name = "午夜回归";
+        daily.minute = 0;
+        midnight.upsert(daily, now);
+        auto nextMidnight = midnight.next()->originalDue;
+        midnight.tick({nextMidnight - Minute, now.steady + Minute});
+        midnight.cancel({nextMidnight - 30000, now.steady + Minute + 30000});
+        check(switches.save(midnight.state, error), "midnight cancellation persisted");
+        Engine cancelled(calendar);
+        cancelled.state = switches.load().state;
+        cancelled.tick({nextMidnight - 20000, now.steady + 100000}, Reconcile::Startup);
+        check(!cancelled.active && cancelled.next()->originalDue > nextMidnight,
+              "midnight cancellation date survives JSON roundtrip");
+        midnight.enable(daily.id, false, now);
+        check(switches.save(midnight.state, error), "disabled midnight persisted");
+        Engine disabled(calendar);
+        disabled.state = switches.load().state;
+        disabled.tick({nextMidnight, now.steady + Day}, Reconcile::Startup);
+        check(!disabled.task(daily.id)->enabled && disabled.state.pending.empty() &&
+                  disabled.tick({nextMidnight + Day, now.steady + 2 * Day}).dispatch.empty(),
+              "persisted disable survives midnight and next day");
+        check(disabled.state.logs.front().status == Status::Disabled &&
+                  disabled.state.logs.front().taskId == daily.id,
+              "switch audit roundtrip");
+        check(disabled.state.logs[1].originalDue == nextMidnight, "original schedule log roundtrip");
+        Storage legacy(path / L"legacy");
+        check(legacy.save(e.state, error), "legacy fixture save");
+        nlohmann::json old;
+        {
+            std::ifstream input(legacy.directory / L"state.json");
+            input >> old;
+        }
+        old["schemaVersion"] = 1;
+        for (auto &log : old["logs"]) {
+            log.erase("originalDue");
+            log.erase("taskId");
+            log.erase("revision");
+        }
+        {
+            std::ofstream output(legacy.directory / L"state.json");
+            output << old.dump();
+        }
+        auto migrated = legacy.load();
+        check(!migrated.recovered && !migrated.state.logs[0].originalDue &&
+                  migrated.state.logs[0].at == e.state.logs[0].at &&
+                  migrated.state.logs[0].due == e.state.logs[0].due,
+              "legacy logs stay truthful without fabricated original time");
+        check(legacy.save(migrated.state, error) && !legacy.load().recovered, "legacy upgrade roundtrip");
+        check(formatTime(nextMidnight, true, true).find(L"00:00:00") != std::wstring::npos,
+              "history includes seconds at midnight");
         std::cout << "PASS: " << checks << " persistence/platform assertions\n";
         return 0;
     } catch (const std::exception &e) {

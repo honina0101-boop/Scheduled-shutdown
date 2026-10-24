@@ -19,6 +19,28 @@ def run(command):
     return result.stdout
 scheduler=run([build/'scheduler_tests.exe'])
 storage=run([build/'platform_tests.exe',out/'test-storage'])
+# An exclusive data-directory file lock is shared across Windows sessions.
+# Hold the lock from another process and verify the app never starts its scheduler.
+lock_kernel=ctypes.WinDLL('kernel32',use_last_error=True)
+lock_kernel.CreateFileW.argtypes=[wintypes.LPCWSTR,wintypes.DWORD,wintypes.DWORD,ctypes.c_void_p,wintypes.DWORD,wintypes.DWORD,wintypes.HANDLE]
+lock_kernel.CreateFileW.restype=wintypes.HANDLE
+lock_kernel.CloseHandle.argtypes=[wintypes.HANDLE]
+lock_output=out/('lock-probe-'+str(time.time_ns()))
+lock_data=lock_output/'data';lock_data.mkdir(parents=True,exist_ok=True)
+lock_handle=lock_kernel.CreateFileW(str(lock_data/'instance.lock'),0xC0000000,0,None,4,0x80,None)
+assert lock_handle != ctypes.c_void_p(-1).value,'cannot create exclusive test lock'
+try:
+    run([exe,'--smoke-test',lock_output])
+    assert not (lock_output/'smoke-results.json').exists(),'second instance ran despite exclusive lock'
+    assert not (lock_data/'state.json').exists(),'blocked instance changed scheduler state'
+finally:
+    lock_kernel.CloseHandle(lock_handle)
+run([exe,'--smoke-test',lock_output])
+assert json.loads((lock_output/'smoke-results.json').read_text(encoding='utf-8'))['passed'],'lock was not released for restart'
+blocked_output=out/('lock-denied-'+str(time.time_ns()));blocked_output.mkdir(parents=True,exist_ok=True)
+(blocked_output/'data').write_text('not a directory',encoding='ascii')
+run([exe,'--smoke-test',blocked_output])
+assert not (blocked_output/'smoke-results.json').exists(),'app started after lock directory failure'
 ui_result=out/'ui/smoke-results.json'
 if ui_result.exists():
     assert ui_result.resolve().is_relative_to(ROOT),'test report path escaped workspace'
@@ -70,10 +92,10 @@ report={
  'os':platform.platform(),'binary_bytes':size,'binary_sha256':hashlib.sha256(exe.read_bytes()).hexdigest(),
  'scheduler':{'passed':True,'assertions':int(re.search(r'PASS: (\d+)',scheduler)[1])},
  'persistence_platform':{'passed':True,'assertions':int(re.search(r'PASS: (\d+)',storage)[1])},
- 'ui':ui,'cold_tray':cold,'after_window_hidden':warm,'dll_imports':dlls,'autostart_unchanged':True,
+ 'ui':ui,'instance_lock':{'passed':True,'checks':4},'cold_tray':cold,'after_window_hidden':warm,'dll_imports':dlls,'autostart_unchanged':True,
  'unverified':['real shutdown on a dedicated test machine','Windows 11 hardware','multiple physical monitors','actual logon startup','real suspend/resume']}
 (out/'report.json').write_text(json.dumps(report,ensure_ascii=False,indent=2),encoding='utf-8')
-total=report['scheduler']['assertions']+report['persistence_platform']['assertions']+ui['checks']
+total=report['scheduler']['assertions']+report['persistence_platform']['assertions']+ui['checks']+report['instance_lock']['checks']
 text=f"""# 本地验证报告
 
 测试时间：{report['tested_at']}（北京时间）
@@ -86,6 +108,7 @@ SHA-256：{report['binary_sha256']}
 - 调度：{report['scheduler']['assertions']} 项断言通过。
 - Windows 时区及存储：{report['persistence_platform']['assertions']} 项断言通过。
 - 界面模拟自检：{ui['checks']} 项通过。
+- 跨进程数据目录独占锁／失败阻断：{report['instance_lock']['checks']} 项通过。
 - 合计：{total} 项。
 - 模拟测试没有调用真实关机，没有修改真实自启动项。
 - 导出并查看浅／深色、任务编辑、设置、记录和提醒；另导出 150%／200%。
@@ -98,6 +121,7 @@ SHA-256：{report['binary_sha256']}
 | 显示窗口后隐藏 | {warm['working_set_mib']} | {warm['private_mib']} | {warm['cpu_percent_one_core']} |
 
 每种模式观察约 8 秒。峰值及完整输出见 build/qa/report.json。当前机器样本不代表所有驱动与系统版本。
+工作集目标为 30 MiB：冷启动样本{'达标' if cold['working_set_mib'] <= 30 else '未达标'}，显示窗口后隐藏的样本{'达标' if warm['working_set_mib'] <= 30 else '未达标'}；这是资源目标的实测状态，不作为功能通过的替代。
 
 ## 实测边界
 

@@ -147,7 +147,7 @@ std::string newId() {
     }
     return out;
 }
-std::wstring formatTime(Time value, bool date) {
+std::wstring formatTime(Time value, bool date, bool seconds) {
     WindowsCalendar calendar;
     auto local = calendar.localSystemTime(value);
     if (!local)
@@ -158,7 +158,12 @@ std::wstring formatTime(Time value, bool date) {
                  local->wHour, local->wMinute);
     else
         swprintf(buffer, 80, L"%02u:%02u", local->wHour, local->wMinute);
-    return buffer;
+    std::wstring result = buffer;
+    if (seconds) {
+        swprintf(buffer, 80, L":%02u", local->wSecond);
+        result += buffer;
+    }
+    return result;
 }
 std::wstring describe(const Task &t) {
     if (t.kind == Kind::Once)
@@ -198,6 +203,10 @@ std::wstring describeStatus(Status s) {
         return L"结果待确认";
     case Status::Requested:
         return L"已请求关机";
+    case Status::Enabled:
+        return L"已启用任务";
+    case Status::Disabled:
+        return L"已停用任务";
     default:
         return L"请求失败";
     }
@@ -216,7 +225,7 @@ std::filesystem::path defaultDataDirectory() {
     return path / L"Evenfall";
 }
 json encode(const State &s) {
-    json j = {{"schemaVersion", 1},
+    json j = {{"schemaVersion", 2},
               {"settings",
                {{"paused", s.settings.paused},
                 {"autostart", s.settings.autostart},
@@ -246,18 +255,22 @@ json encode(const State &s) {
                                 {"day", p.day},
                                 {"originalDue", p.originalDue},
                                 {"due", p.due},
-                                {"detached", p.detached}});
+                                {"detached", p.detached},
+                                {"adjustment", p.adjustment}});
     for (const auto &l : s.logs)
         j["logs"].push_back({{"key", l.key},
                              {"name", l.name},
                              {"detail", l.detail},
                              {"at", l.at},
                              {"due", l.due},
-                             {"status", statusName(l.status)}});
+                             {"status", statusName(l.status)},
+                             {"originalDue", l.originalDue ? json(*l.originalDue) : json(nullptr)},
+                             {"taskId", l.taskId},
+                             {"revision", l.revision}});
     return j;
 }
 State decode(const json &j) {
-    if (j.at("schemaVersion").get<int>() != 1)
+    if (j.at("schemaVersion").get<int>() != 1 && j.at("schemaVersion").get<int>() != 2)
         throw std::runtime_error("unsupported schema");
     State s;
     const auto &a = j.at("settings");
@@ -306,6 +319,7 @@ State decode(const json &j) {
         p.originalDue = x.at("originalDue");
         p.due = x.at("due");
         p.detached = x.at("detached");
+        p.adjustment = x.value("adjustment", std::string{});
         auto t =
             std::find_if(s.tasks.begin(), s.tasks.end(), [&](const auto &v) { return v.id == p.taskId; });
         if (t == s.tasks.end() || !t->enabled || t->completed || t->revision != p.revision || p.key.empty() ||
@@ -321,6 +335,10 @@ State decode(const json &j) {
         l.detail = x.at("detail");
         l.at = x.at("at");
         l.due = x.at("due");
+        if (x.contains("originalDue") && !x.at("originalDue").is_null())
+            l.originalDue = x.at("originalDue").get<Time>();
+        l.taskId = x.value("taskId", std::string{});
+        l.revision = x.value("revision", 0);
         auto st = x.at("status").get<std::string>();
         if (st == "cancelled")
             l.status = Status::Cancelled;
@@ -334,6 +352,10 @@ State decode(const json &j) {
             l.status = Status::Requested;
         else if (st == "failed")
             l.status = Status::Failed;
+        else if (st == "enabled")
+            l.status = Status::Enabled;
+        else if (st == "disabled")
+            l.status = Status::Disabled;
         else
             throw std::runtime_error("invalid status");
         s.logs.push_back(l);
@@ -414,7 +436,7 @@ bool Storage::save(const State &state, std::wstring &error) const {
 }
 PowerResult requestShutdown(bool force, bool simulate) {
     if (simulate)
-        return {true, L"模拟模式：没有调用系统关机"};
+        return {true, L"模拟模式：没有调用系统关机", snapshot().wall};
     HANDLE token = nullptr;
     if (!OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &token))
         return {false, L"无法获取关机权限"};
@@ -435,6 +457,7 @@ PowerResult requestShutdown(bool force, bool simulate) {
         CloseHandle(token);
         return {false, L"当前账户没有关机权限，请检查系统策略"};
     }
+    Time requestedAt = snapshot().wall;
     BOOL ok =
         ExitWindowsEx(EWX_POWEROFF | (force ? EWX_FORCE : 0),
                       SHTDN_REASON_MAJOR_APPLICATION | SHTDN_REASON_MINOR_OTHER | SHTDN_REASON_FLAG_PLANNED);
@@ -442,7 +465,8 @@ PowerResult requestShutdown(bool force, bool simulate) {
     AdjustTokenPrivileges(token, FALSE, &previous, 0, nullptr, nullptr);
     CloseHandle(token);
     return {ok != FALSE,
-            ok ? L"Windows 已接受关机请求" : L"Windows 拒绝关机请求（错误 " + std::to_wstring(code) + L"）"};
+            ok ? L"Windows 已接受关机请求" : L"Windows 拒绝关机请求（错误 " + std::to_wstring(code) + L"）",
+            requestedAt};
 }
 std::wstring executablePath() {
     wchar_t path[32768];

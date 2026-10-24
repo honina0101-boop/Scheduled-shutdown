@@ -121,7 +121,7 @@ class App {
     IDWriteFactory *writer = nullptr;
     HFONT editorFont = nullptr;
     HBRUSH fieldBrush = nullptr;
-    HANDLE mutex = nullptr;
+    HANDLE instanceLock = INVALID_HANDLE_VALUE;
     UINT taskbarCreated = 0;
     std::wstring mainClass, editorClass, warningClass;
     bool simulate = false, smoke = false, trayStart = false, preview = false, blocked = false,
@@ -133,6 +133,8 @@ class App {
     std::wstring banner, editorError;
     std::array<HWND, 4> fields{};
     Task draft;
+    bool snoozeExpanded = false;
+    std::vector<std::string> snoozeKeys;
     App(HINSTANCE h, std::filesystem::path data) : instance(h), storage(std::move(data)) {}
     ~App() {
         release(writer);
@@ -141,8 +143,8 @@ class App {
             DeleteObject(editorFont);
         if (fieldBrush)
             DeleteObject(fieldBrush);
-        if (mutex)
-            CloseHandle(mutex);
+        if (instanceLock != INVALID_HANDLE_VALUE)
+            CloseHandle(instanceLock);
     }
     bool dark() const {
         if (engine.state.settings.theme == "dark")
@@ -195,11 +197,25 @@ class App {
         mainClass = L"Evenfall.Main." + suffix;
         editorClass = L"Evenfall.Editor." + suffix;
         warningClass = L"Evenfall.Warning." + suffix;
-        mutex = CreateMutexW(nullptr, FALSE, (L"Local\\Evenfall." + suffix).c_str());
-        if (GetLastError() == ERROR_ALREADY_EXISTS) {
+        // File sharing rules apply across Windows sessions and elevation levels.
+        // A session-local mutex allowed a scheduled background copy to keep executing
+        // after the interactive copy disabled the same task.
+        std::error_code directoryError;
+        std::filesystem::create_directories(storage.directory, directoryError);
+        if (!directoryError)
+            instanceLock =
+                CreateFileW((storage.directory / L"instance.lock").c_str(), GENERIC_READ | GENERIC_WRITE, 0,
+                            nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (instanceLock == INVALID_HANDLE_VALUE) {
             HWND existing = FindWindowW(mainClass.c_str(), nullptr);
             if (existing)
                 SendMessageW(existing, ShowMessage, 0, 0);
+            else if (!smoke)
+                MessageBoxW(nullptr,
+                            L"无法独占任务数据目录，程序未启动调度。\n\n"
+                            L"请先退出其他会话中的晚安程序，并检查 Windows 计划任务是否仍在运行旧版；"
+                            L"也请确认数据目录可以写入。",
+                            L"晚安 · 启动受阻", MB_OK | MB_ICONWARNING);
             return false;
         }
         for (auto cls : {mainClass, editorClass, warningClass}) {
@@ -304,12 +320,15 @@ class App {
         }
         if (!outcome.dispatch.empty()) {
             hideWarning();
-            ++dispatchCount;
-            auto result = requestShutdown(engine.state.settings.force, simulate);
-            engine.result(outcome.dispatch, result.accepted, utf8(result.message));
+            auto allowed = engine.authorizeDispatch(outcome.dispatch, snapshot());
+            if (!allowed.empty()) {
+                ++dispatchCount;
+                auto result = requestShutdown(engine.state.settings.force, simulate);
+                engine.result(allowed, result.accepted, utf8(result.message), result.requestedAt);
+                if (!result.accepted || simulate)
+                    banner = result.message;
+            }
             save();
-            if (!result.accepted || simulate)
-                banner = result.message;
         }
         if (engine.active) {
             if (preview) {
@@ -335,8 +354,13 @@ class App {
             InvalidateRect(main.window, nullptr, FALSE);
     }
     void hideWarning() {
-        if (warning.window)
+        snoozeExpanded = false;
+        snoozeKeys.clear();
+        if (warning.window) {
+            SetWindowLongPtrW(warning.window, GWL_EXSTYLE,
+                              GetWindowLongPtrW(warning.window, GWL_EXSTYLE) | WS_EX_NOACTIVATE);
             ShowWindow(warning.window, SW_HIDE);
+        }
         preview = false;
         KillTimer(main.window, 3);
         if (warning.window)
@@ -347,16 +371,26 @@ class App {
             return;
         MONITORINFO info{sizeof(info)};
         GetMonitorInfoW(MonitorFromPoint(POINT{0, 0}, MONITOR_DEFAULTTOPRIMARY), &info);
-        warning.scale = windowDpi(warning.window) / 96.f;
-        float s = warning.scale;
-        int w = int(456 * s), h = int((274 + (!preview && !engine.otherWarnings.empty() ? 44 : 0)) * s),
-            margin = int(20 * s);
+        float dpiScale = windowDpi(warning.window) / 96.f;
+        int logicalHeight =
+            274 + (!preview && !engine.otherWarnings.empty() ? 44 : 0) + (snoozeExpanded ? 48 : 0);
+        int margin = int(20 * dpiScale);
+        float s = std::min({dpiScale, (info.rcWork.right - info.rcWork.left - 2 * margin) / 456.f,
+                            (info.rcWork.bottom - info.rcWork.top - 2 * margin) / float(logicalHeight)});
+        if (warning.scale != s)
+            warning.discard();
+        warning.scale = s;
+        int w = int(456 * s), h = int(logicalHeight * s);
         SetWindowPos(warning.window, HWND_TOPMOST, info.rcWork.right - w - margin,
                      info.rcWork.bottom - h - margin + int((1 - warningProgress) * 16 * s), w, h,
                      SWP_NOACTIVATE);
         SetWindowRgn(warning.window, CreateRoundRectRgn(0, 0, w + 1, h + 1, int(32 * s), int(32 * s)), TRUE);
     }
     void showWarning(bool isPreview) {
+        if (snoozeExpanded && !preview && (!engine.active || engine.active->keys != snoozeKeys)) {
+            snoozeExpanded = false;
+            snoozeKeys.clear();
+        }
         if (isPreview && engine.active) {
             showWarning(false);
             return;
@@ -537,7 +571,7 @@ class App {
         }
         return t;
     }
-    void command(int id, HWND source) {
+    void command(int id, HWND) {
         if (id >= 10000) {
             size_t index = (id - 10000) / 10;
             int action = (id - 10000) % 10;
@@ -653,12 +687,22 @@ class App {
                 afterMutation();
             break;
         case CycleAlert:
+            snoozeExpanded = false;
+            snoozeKeys.clear();
             if (!preview && engine.cycleWarning())
                 pump();
             break;
         case Snooze10:
         case Snooze30:
         case Snooze60:
+            if (snoozeExpanded && !preview && (!engine.active || engine.active->keys != snoozeKeys)) {
+                snoozeExpanded = false;
+                snoozeKeys.clear();
+                pump();
+                break;
+            }
+            snoozeExpanded = false;
+            snoozeKeys.clear();
             if (preview) {
                 hideWarning();
                 break;
@@ -667,16 +711,18 @@ class App {
                 afterMutation();
             break;
         case SnoozeMenu: {
-            HMENU m = CreatePopupMenu();
-            AppendMenuW(m, MF_STRING, Snooze10, L"推迟 10 分钟");
-            AppendMenuW(m, MF_STRING, Snooze30, L"推迟 30 分钟");
-            AppendMenuW(m, MF_STRING, Snooze60, L"推迟 60 分钟");
-            POINT pt;
-            GetCursorPos(&pt);
-            int c = TrackPopupMenu(m, TPM_RETURNCMD | TPM_RIGHTBUTTON, pt.x, pt.y, 0, source, nullptr);
-            DestroyMenu(m);
-            if (c)
-                command(c, source);
+            snoozeExpanded = !snoozeExpanded;
+            snoozeKeys = engine.active ? engine.active->keys : std::vector<std::string>{};
+            warning.focus = SnoozeMenu;
+            // Activation is allowed only in response to the user's explicit interaction.
+            SetWindowLongPtrW(warning.window, GWL_EXSTYLE,
+                              GetWindowLongPtrW(warning.window, GWL_EXSTYLE) & ~WS_EX_NOACTIVATE);
+            if (!smoke) {
+                SetForegroundWindow(warning.window);
+                SetFocus(warning.window);
+            }
+            placeWarning();
+            InvalidateRect(warning.window, nullptr, FALSE);
             break;
         }
         case EditorOnce:
@@ -928,7 +974,7 @@ class App {
         p.button(rect(185, y, 126, 35), DataFolder, L"打开数据目录");
         if (blocked)
             p.button(rect(w - 171, y, 143, 35), RetrySave, L"重试保存");
-        p.text(L"晚安 1.0.0 · 离线运行 · 当前用户的数据独立保存", rect(30, y + 49, w - 60, 25), 11, t.muted);
+        p.text(L"晚安 1.0.1 · 离线运行 · 当前用户的数据独立保存", rect(30, y + 49, w - 60, 25), 11, t.muted);
         p.unclip();
     }
     void drawHistory(Painter &p, float w, float h) {
@@ -937,7 +983,7 @@ class App {
         p.text(L"最近 100 条记录。关机请求交给 Windows 后，由系统完成关闭。", rect(32, 138, w - 64, 25), 12,
                t.muted);
         float top = 182, bottom = h - 29, height = std::max(0.f, bottom - top);
-        main.maxScroll = std::max(0.f, float(engine.state.logs.size()) * 83 - height);
+        main.maxScroll = std::max(0.f, float(engine.state.logs.size()) * 136 - height);
         main.scroll = std::clamp(main.scroll, 0.f, main.maxScroll);
         if (engine.state.logs.empty())
             p.text(L"尚无执行记录，任务发生后会显示在这里。", rect(32, top + 35, w - 64, 45), 14, t.muted,
@@ -945,11 +991,11 @@ class App {
         p.clip(rect(24, top, w - 48, height));
         for (size_t i = 0; i < engine.state.logs.size(); i++) {
             auto log = engine.state.logs[i];
-            float y = top + i * 83 - main.scroll;
-            if (y + 75 < top || y > bottom)
+            float y = top + i * 136 - main.scroll;
+            if (y + 126 < top || y > bottom)
                 continue;
-            p.fill(rect(28, y, w - 56, 74), t.card, 12);
-            p.border(rect(28, y, w - 56, 74), t.border, 12);
+            p.fill(rect(28, y, w - 56, 126), t.card, 12);
+            p.border(rect(28, y, w - 56, 126), t.border, 12);
             unsigned c = log.status == Status::Failed      ? 0xD37070
                          : log.status == Status::Missed    ? 0xBE923D
                          : log.status == Status::Requested ? t.good
@@ -957,11 +1003,21 @@ class App {
             p.fill(rect(43, y + 21, 99, 28), c, 8, .12f);
             p.text(describeStatus(log.status), rect(43, y + 21, 99, 28), 12, c, 550,
                    DWRITE_TEXT_ALIGNMENT_CENTER);
-            p.text(wide(log.name), rect(159, y + 9, w - 387, 29), 14, t.text, 550);
-            p.text(log.detail.empty() ? L"本次触发已处理" : wide(log.detail), rect(160, y + 40, w - 224, 22),
+            p.text(wide(log.name), rect(159, y + 7, w - 210, 26), 14, t.text, 550);
+            bool operation = log.status == Status::Enabled || log.status == Status::Disabled;
+            std::wstring original =
+                operation ? L"任务开关操作"
+                          : L"原计划：" +
+                                (log.originalDue ? formatTime(*log.originalDue, true, true) : L"旧版未记录");
+            p.text(original, rect(160, y + 33, w - 208, 21), 11, t.muted);
+            if (!operation)
+                p.text(L"本次目标：" + formatTime(log.due, true, true), rect(160, y + 54, w - 208, 21), 11,
+                       t.muted);
+            p.text((log.status == Status::Requested ? L"实际请求：" : L"记录时间：") +
+                       formatTime(log.at, true, true),
+                   rect(160, y + 75, w - 208, 21), 11, t.muted);
+            p.text(log.detail.empty() ? L"本次触发已处理" : wide(log.detail), rect(160, y + 97, w - 208, 22),
                    11, t.muted);
-            p.text(formatTime(log.at, true), rect(w - 250, y + 9, 202, 28), 11, t.muted, 400,
-                   DWRITE_TEXT_ALIGNMENT_TRAILING);
         }
         p.unclip();
     }
@@ -1076,8 +1132,20 @@ class App {
             p.button(rect(w - 83, 215, 52, 28), CycleAlert, L"切换");
         }
         p.button(rect(23, h - 53, 190, 35), CancelCurrent, preview ? L"关闭预览" : L"取消本次", true);
-        p.button(rect(225, h - 53, w - 281, 35), Snooze10, L"推迟 10 分钟");
-        p.button(rect(w - 49, h - 53, 26, 35), SnoozeMenu, L"▾");
+        p.button(rect(225, h - 53, w - (snoozeExpanded ? 248 : 281), 35),
+                 snoozeExpanded ? SnoozeMenu : Snooze10, snoozeExpanded ? L"收起选项" : L"推迟 10 分钟");
+        if (!snoozeExpanded)
+            p.button(rect(w - 49, h - 53, 26, 35), SnoozeMenu, L"▾");
+        if (snoozeExpanded) {
+            for (int i = 0; i < 3; ++i)
+                p.button(rect(23 + i * 139, h - 99, 132, 34),
+                         i == 0   ? Snooze10
+                         : i == 1 ? Snooze30
+                                  : Snooze60,
+                         i == 0   ? L"10 分钟"
+                         : i == 1 ? L"30 分钟"
+                                  : L"60 分钟");
+        }
     }
     void draw(Surface &s, Painter &p, float w, float h) {
         s.hits.clear();
@@ -1204,17 +1272,23 @@ class App {
     bool key(MSG &message) {
         if (message.message != WM_KEYDOWN)
             return false;
-        Surface *s = editor.window ? &editor : &main;
+        Surface *s = message.hwnd == warning.window ? &warning : editor.window ? &editor : &main;
         if (!IsWindowVisible(s->window))
             return false;
         if (message.wParam == VK_ESCAPE) {
-            if (editor.window)
+            if (s == &warning) {
+                snoozeExpanded = false;
+                snoozeKeys.clear();
+                warning.focus = SnoozeMenu;
+                placeWarning();
+                InvalidateRect(warning.window, nullptr, FALSE);
+            } else if (editor.window)
                 closeEditor();
             else
                 ShowWindow(main.window, SW_HIDE);
             return true;
         }
-        if (message.wParam == 'N' && (GetKeyState(VK_CONTROL) & 0x8000) && !editor.window) {
+        if (s != &warning && message.wParam == 'N' && (GetKeyState(VK_CONTROL) & 0x8000) && !editor.window) {
             openEditor();
             return true;
         }
@@ -1345,6 +1419,25 @@ class App {
             size_t pending = engine.state.pending.size();
             command(Preview, main.window);
             smokeCheck(capture(warning, smokeOutput / L"warning-preview.png"), "preview capture");
+            for (int i = 0; i < 4; ++i) {
+                command(SnoozeMenu, warning.window);
+                smokeCheck(snoozeExpanded, "inline options expand");
+                MSG escape{};
+                escape.message = WM_KEYDOWN;
+                escape.hwnd = warning.window;
+                escape.wParam = VK_ESCAPE;
+                smokeCheck(key(escape) && !snoozeExpanded, "inline options escape");
+            }
+            command(SnoozeMenu, warning.window);
+            smokeCheck(capture(warning, smokeOutput / L"warning-options.png"), "inline options capture");
+            smokeCheck(capture(warning, smokeOutput / L"warning-options-150.png", 1.5f),
+                       "inline options 150%");
+            command(ThemeDark, main.window);
+            smokeCheck(capture(warning, smokeOutput / L"warning-options-dark-200.png", 2),
+                       "dark inline options 200%");
+            command(ThemeLight, main.window);
+            smokeCheck((GetWindowLongPtrW(warning.window, GWL_EXSTYLE) & WS_EX_TOPMOST) != 0,
+                       "expanded card stays topmost");
             command(CancelCurrent, warning.window);
             smokeCheck(!preview && engine.state.pending.size() == pending, "preview cannot mutate");
             auto now = snapshot();
@@ -1360,7 +1453,9 @@ class App {
             afterMutation();
             smokeCheck(engine.active.has_value(), "warning connected");
             smokeCheck(capture(warning, smokeOutput / L"warning.png"), "warning capture");
+            command(SnoozeMenu, warning.window);
             command(CancelCurrent, warning.window);
+            smokeCheck(!snoozeExpanded, "cancel closes inline options");
             smokeCheck(engine.task("imminent")->completed && !engine.active, "cancel popup");
             auto concurrentNow = snapshot();
             for (int i = 0; i < 2; ++i) {
@@ -1378,7 +1473,16 @@ class App {
             afterMutation();
             smokeCheck(engine.active && engine.otherWarnings.size() == 1, "parallel warning connected");
             smokeCheck(capture(warning, smokeOutput / L"warning-parallel.png"), "parallel warning capture");
+            command(SnoozeMenu, warning.window);
+            auto boundKeys = snoozeKeys;
+            auto deadlineBeforeOptions = engine.active->monotonicDue;
+            smokeCheck(snoozeExpanded && engine.active->monotonicDue == deadlineBeforeOptions,
+                       "inline options retain deadline");
+            smokeCheck(capture(warning, smokeOutput / L"warning-parallel-options.png"),
+                       "parallel inline options capture");
             command(CycleAlert, warning.window);
+            smokeCheck(!snoozeExpanded && engine.active->keys != boundKeys,
+                       "switch group closes bound options");
             smokeCheck(engine.active && engine.active->keys.front().starts_with("parallel-1/"),
                        "parallel warning switch");
             command(CancelCurrent, warning.window);
@@ -1386,6 +1490,42 @@ class App {
                            engine.active->keys.front().starts_with("parallel-0/"),
                        "parallel cancellation preserves other group");
             command(CancelCurrent, warning.window);
+            {
+                Task snoozable;
+                auto time = snapshot();
+                snoozable.id = "inline-snooze";
+                snoozable.name = "卡片内推迟回归";
+                snoozable.kind = Kind::Countdown;
+                snoozable.onceDue = time.wall + 30000;
+                engine.upsert(snoozable, time);
+                afterMutation();
+                command(SnoozeMenu, warning.window);
+                RECT bounds{};
+                GetWindowRect(warning.window, &bounds);
+                MONITORINFO work{sizeof(work)};
+                GetMonitorInfoW(MonitorFromWindow(warning.window, MONITOR_DEFAULTTOPRIMARY), &work);
+                smokeCheck(bounds.left >= work.rcWork.left && bounds.top >= work.rcWork.top &&
+                               bounds.right <= work.rcWork.right && bounds.bottom <= work.rcWork.bottom,
+                           "expanded card stays inside work area");
+                smokeCheck(capture(warning, smokeOutput / L"inline-keyboard.png"),
+                           "keyboard options capture");
+                SetFocus(warning.window);
+                warning.focus = Snooze10;
+                MSG tab{};
+                tab.message = WM_KEYDOWN;
+                tab.hwnd = warning.window;
+                tab.wParam = VK_TAB;
+                smokeCheck(key(tab) && warning.focus == Snooze30, "Tab selects thirty minutes");
+                tab.wParam = VK_RETURN;
+                smokeCheck(key(tab), "Enter applies selected snooze");
+                const auto &p = *std::find_if(engine.state.pending.begin(), engine.state.pending.end(),
+                                              [](const auto &p) { return p.taskId == "inline-snooze"; });
+                auto left = p.monotonicDue - snapshot().steady;
+                smokeCheck(p.detached && left > 29 * Minute && left <= 30 * Minute && !snoozeExpanded,
+                           "inline selection snoozes bound occurrence by thirty minutes");
+                engine.erase(snoozable.id, snapshot());
+                afterMutation();
+            }
             Engine restarted(calendar);
             restarted.state = storage.load().state;
             restarted.tick(snapshot(), Reconcile::Startup);
@@ -1434,13 +1574,26 @@ class App {
                 afterMutation();
                 smokeCheck(engine.active.has_value(), "test warning armed");
                 engine.active->monotonicDue = snapshot().steady - 1;
+                int callsBefore = dispatchCount;
+                pump();
+                smokeCheck(dispatchCount == callsBefore && engine.active.has_value(),
+                           "early monotonic deadline cannot dispatch");
+                engine.active->due = snapshot().wall - 1;
+                for (auto &p : engine.state.pending)
+                    if (std::find(engine.active->keys.begin(), engine.active->keys.end(), p.key) !=
+                        engine.active->keys.end()) {
+                        p.due = engine.active->due;
+                        p.monotonicDue = engine.active->monotonicDue;
+                    }
             };
             int calls = dispatchCount;
             addImminent("simulated-dispatch");
+            command(SnoozeMenu, warning.window);
             pump();
             smokeCheck(dispatchCount == calls + 1 && engine.task("simulated-dispatch")->completed,
                        "one simulated OS request");
             smokeCheck(engine.state.logs.front().status == Status::Requested, "simulated result recorded");
+            smokeCheck(!snoozeExpanded, "dispatch closes inline options");
             addImminent("failed-commit");
             auto original = storage.directory;
             auto blocker = smokeOutput / L"blocker";

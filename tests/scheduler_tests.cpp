@@ -133,6 +133,10 @@ int main() {
             check(e.tick(at(d, 1389, 6000)).dispatch.empty(), "dispatch not repeated");
             e.result(r.dispatch, true, "simulation");
             check(e.state.logs[0].status == Status::Requested, "request result");
+            check(e.state.logs[0].originalDue == at(d, 1380).wall &&
+                      e.state.logs[0].due == at(d, 1389, 5000).wall &&
+                      e.state.logs[0].detail.find("推迟") != std::string::npos,
+                  "snoozed request keeps original target effective target and reason");
             check(e.state.logs[2].status == Status::Snoozed, "snooze history kept");
         }
         {
@@ -168,6 +172,10 @@ int main() {
             check(r.warningOpened && e.remaining(at(d, 1379, 30000)) == Minute, "startup grants full minute");
             check(e.tick(at(d, 1380)).dispatch.empty(), "not premature");
             check(e.tick(at(d, 1380, 30000)).dispatch.size() == 1, "extended warning dispatch");
+            check(e.state.logs.front().originalDue == at(d, 1380).wall &&
+                      e.state.logs.front().due == at(d, 1380, 30000).wall &&
+                      e.state.logs.front().detail.find("60 秒") != std::string::npos,
+                  "extended warning records original target and reason");
         }
         {
             Engine e(cal);
@@ -236,7 +244,7 @@ int main() {
             e.cancel(at(d, 1379, 40000));
             e.tick(at(d, 1379, 40000));
             check(e.active && e.active->keys.size() == 1, "nearby remains");
-            check(e.remaining(at(d, 1379, 40000)) == Minute, "nearby full minute");
+            check(e.remaining(at(d, 1379, 40000)) == 50000, "normal nearby task retains target");
         }
         {
             Engine e(cal);
@@ -301,6 +309,109 @@ int main() {
             e.enable("zone", true, at(d, 600));
             check(e.next() && e.next()->due == zone.resolve(d, 1380).value(),
                   "disabled one-off follows local zone on restart");
+        }
+        for (Time lead : {2, 12, 20}) {
+            Engine e(cal);
+            e.upsert(weekly("midnight", 0), at(d, 1200));
+            auto start = at(d, 1439, 7);
+            e.tick(start);
+            auto target = at(d + 1, 0);
+            check(e.active && e.active->due == target.wall, "timer jitter must not move midnight");
+            check(e.tick({target.wall - lead, target.steady}).dispatch.empty(),
+                  "wall clock guards early monotonic clock");
+            check(e.remaining({target.wall - lead, target.steady}) == lead,
+                  "remaining includes wall clock guard");
+            auto r = e.tick({target.wall, target.steady + lead});
+            check(r.dispatch.size() == 1, "midnight dispatch at target");
+            auto allowed = e.authorizeDispatch(r.dispatch, {target.wall, target.steady + lead});
+            check(allowed.size() == 1 && e.state.logs.front().originalDue == target.wall &&
+                      e.state.logs.front().due == target.wall,
+                  "schedule and effective time retained");
+            e.result(allowed, true, "simulated", target.wall + 3);
+            check(e.state.logs.front().at == target.wall + 3, "actual request timestamp retained");
+            check(e.tick({target.wall + 10, target.steady + 30}).dispatch.empty(),
+                  "midnight dispatched only once");
+        }
+        for (int phase = 0; phase < 4; ++phase) {
+            Engine e(cal);
+            e.upsert(weekly("disabled-midnight", 0), at(d, 1200));
+            Task stale = *e.task("disabled-midnight");
+            auto when = phase == 0 ? at(d, 1438) : at(d, 1439, phase == 3 ? 59999 : 10000);
+            if (phase != 0)
+                e.tick(at(d, 1439));
+            if (phase == 2)
+                e.snooze(at(d, 1439, 5000), 10);
+            e.enable("disabled-midnight", false, when);
+            check(e.state.logs.front().status == Status::Disabled && e.state.logs.front().taskId == stale.id,
+                  "disable audit identifies task");
+            e.upsert(stale, when);
+            check(!e.task(stale.id)->enabled && !e.active && e.state.pending.empty(),
+                  "stale editor cannot enable task");
+            check(e.tick(at(d + 1, 0)).dispatch.empty(), "disabled midnight never dispatches");
+            Engine restart(cal);
+            restart.state = e.state;
+            restart.tick(at(d + 1, 1), Reconcile::Startup);
+            check(!restart.active && restart.state.pending.empty() &&
+                      restart.tick(at(d + 2, 0)).dispatch.empty(),
+                  "disable survives restart and next day");
+            restart.enable(stale.id, true, at(d + 2, 1));
+            check(restart.next() && restart.next()->due == at(d + 3, 0).wall &&
+                      restart.state.logs.front().status == Status::Enabled,
+                  "manual enable restores future schedule");
+        }
+        {
+            Engine e(cal);
+            e.upsert(weekly("cancel-midnight", 0), at(d, 1200));
+            e.tick(at(d, 1439));
+            e.cancel(at(d, 1439, 20000));
+            check(e.next()->due == at(d + 2, 0).wall, "cancel belongs to next midnight date");
+            Engine restart(cal);
+            restart.state = e.state;
+            restart.tick(at(d, 1439, 30000), Reconcile::Startup);
+            check(restart.tick(at(d + 1, 0)).dispatch.empty() && restart.next()->due == at(d + 2, 0).wall,
+                  "cancelled midnight cannot return after restart");
+            restart.tick(at(d + 1, 1439));
+            check(restart.tick(at(d + 2, 0)).dispatch.size() == 1, "following midnight continues");
+        }
+        {
+            Engine e(cal);
+            e.upsert(weekly("off", 0), at(d, 1200));
+            e.upsert(weekly("on", 0), at(d, 1200));
+            e.tick(at(d, 1439));
+            e.enable("off", false, at(d, 1439, 59999));
+            auto r = e.tick(at(d + 1, 0));
+            check(r.dispatch.size() == 1 && r.dispatch[0].find("on/") == 0,
+                  "disable preserves grouped enabled task");
+            e.enable("on", false, at(d + 1, 0));
+            check(e.authorizeDispatch(r.dispatch, at(d + 1, 0)).empty(),
+                  "final dispatch rechecks enabled flag");
+        }
+        for (int invalid = 0; invalid < 3; ++invalid) {
+            Engine e(cal);
+            e.upsert(weekly("guard", 0), at(d, 1200));
+            e.tick(at(d, 1439));
+            auto r = e.tick(at(d + 1, 0));
+            if (invalid == 0)
+                e.state.settings.paused = true;
+            if (invalid == 1)
+                ++e.task("guard")->revision;
+            if (invalid == 2)
+                e.erase("guard", at(d + 1, 0));
+            check(e.authorizeDispatch(r.dispatch, at(d + 1, 0)).empty(),
+                  "dispatch rechecks pause revision and deletion");
+        }
+        {
+            Engine e(cal);
+            for (int i = 0; i < 120; ++i)
+                e.upsert(weekly("group-" + std::to_string(i), 0), at(d, 1200));
+            e.tick(at(d, 1439));
+            auto r = e.tick(at(d + 1, 0));
+            check(e.state.logs.size() == 100 && r.dispatch.size() == 120,
+                  "history stays bounded for large group");
+            check(e.authorizeDispatch(r.dispatch, at(d + 1, 0)).size() == 120,
+                  "final guard is independent of history retention");
+            check(e.authorizeDispatch(r.dispatch, at(d + 1, 0)).empty(),
+                  "dispatch authorization consumed once");
         }
         std::cout << "PASS: " << checks << " scheduler assertions\n";
         return 0;

@@ -1,4 +1,4 @@
-# 晚安 · 定时关机（Evenfall 1.0.0）
+# 晚安 · 定时关机（Evenfall 1.0.1）
 
 一款离线运行的 Windows 10/11 64 位定时关机工具。蓝紫主色、浅深色主题、托盘常驻，以及可以取消或推迟的右下角提醒。
 
@@ -8,11 +8,17 @@
 
 ## 下载（普通用户）
 
-无需编译或安装。推荐下载 [Windows 64 位便携包](https://github.com/honina0101-boop/Scheduled-shutdown/releases/download/v1.0.0/Evenfall-1.0.0-win-x64.zip)，解压后双击 **Evenfall.exe**。
+无需编译或安装。推荐下载 [Windows 64 位便携包](https://github.com/honina0101-boop/Scheduled-shutdown/releases/download/v1.0.1/Evenfall-1.0.1-win-x64.zip)，解压后双击 **Evenfall.exe**。
 
-也可以下载 [单文件 EXE](https://github.com/honina0101-boop/Scheduled-shutdown/releases/download/v1.0.0/Evenfall.exe)（约 1.28 MB），或访问 [版本下载页](https://github.com/honina0101-boop/Scheduled-shutdown/releases/latest)。
+也可以下载 [单文件 EXE](https://github.com/honina0101-boop/Scheduled-shutdown/releases/download/v1.0.1/Evenfall.exe)（小于 5 MB），或访问 [版本下载页](https://github.com/honina0101-boop/Scheduled-shutdown/releases/latest)。
 
 GitHub「Code → Download ZIP」和版本页自动提供的「Source code」是源码，普通用户请选择上面的便携包或 EXE。程序目前未做代码签名。
+
+## 升级与开发记录
+
+升级到 1.0.1 前，先停止仍在运行旧版的 Windows 计划任务，再从托盘退出旧版，确认所有旧进程退出后复制备份 `%LOCALAPPDATA%\Evenfall`，再替换 EXE。任务和旧日志会保留；新版本使用 schemaVersion 2，回退 1.0.0 时须恢复升级前备份，不能直接让旧版读取新版数据。
+
+开发节点、原因、验证结果和未验证事项见 [开发交接记录](docs/HANDOFF.md)。每次代码变更须同步追加记录。
 
 ## 使用
 
@@ -28,14 +34,23 @@ GitHub「Code → Download ZIP」和版本页自动提供的「Source code」是
 
 ## 调度规则
 
+- 同一数据目录使用跨 Windows 会话的独占文件锁，只允许一个新版实例调度。锁定失败时不启动调度。旧版不遵守该锁，升级必须退出所有旧副本；建议仅用程序内登录自启动，避免同时设置非交互式计划任务。
+
 - 多个任务同一目标时间时合并提醒；取消／推迟作用于这组任务的本次触发。不同时间的提醒独立计时，同时出现时可以「切换」查看，取消一组不会延后另一组。
 - 改名保留已经取消的状态。改变时间／星期会重新安排该任务；保存倒计时任务会从现在重新计时。
+- 任务右侧开关关闭后持续停用，必须手动开启；不会跨午夜自动恢复。停用会清除该任务的提醒和推迟项。
+- 每天 00:00 的任务在前一天 23:59 取消，跳过的是紧接着的午夜，下一次为再下一天 00:00；不使用额外的 24 小时冷却。
+- 正常提醒保持设定时间；系统时间和倒计时均到达目标才提交请求，允许系统调度带来的短暂延迟。记录区分别显示原计划、本次目标、实际请求时间（秒），旧记录缺少原计划时显示“旧版未记录”。
 - 取消一次任务后结束；重复任务继续等待下一个选中日期。结果保存后，重启软件不会恢复本次任务。
 - 睡眠、软件未运行或暂停导致错过时间时，跳过这次，不补关机，也不主动唤醒电脑。
 - 启动／恢复时距离目标不足 60 秒，会给出完整 60 秒提醒，本次时间顺延。
 - 暂停会关闭当前提醒；恢复只处理未来任务，仍未到期的任务重新提醒。锁屏不暂停调度，锁屏时无法操作桌面提醒。
 - 普通关机可能被未保存文档的应用阻止；强制模式可能丢失未保存内容。
 - 「已请求关机」表示 Windows 接受请求，最终结果由系统决定。请求登记后进程中断的记录显示「结果待确认」，不会自动重试。
+
+提醒示例（模拟任务，推迟选项在卡片内展开）：
+
+![提醒与推迟选项](docs/reminder.png)
 
 ## 数据
 
@@ -108,3 +123,5 @@ python scripts/release.py --reuse-exe
 python scripts/publish_release.py --prepare-only
 python scripts/publish_release.py --target-sha (git rev-parse HEAD)
 ~~~
+
+运行中的旧 EXE 无法覆盖时，可把发布命令改为 `python scripts/release.py --dist-dir dist/v1.0.1`，后续验证、打包及发布均指定同一目录；`publish_release.py` 也支持 `--dist-dir`。不要强行覆盖正在运行的程序。

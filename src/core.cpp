@@ -23,6 +23,10 @@ const char *statusName(Status s) {
         return "requesting";
     case Status::Requested:
         return "requested";
+    case Status::Enabled:
+        return "enabled";
+    case Status::Disabled:
+        return "disabled";
     default:
         return "failed";
     }
@@ -41,7 +45,8 @@ const Task *Engine::task(const std::string &id) const {
 }
 void Engine::append(const Occurrence &p, Status s, Snapshot now, const std::string &detail) {
     auto *t = task(p.taskId);
-    state.logs.insert(state.logs.begin(), Log{p.key, t ? t->name : "", detail, now.wall, p.due, s});
+    state.logs.insert(state.logs.begin(), Log{p.key, t ? t->name : "", detail.empty() ? p.adjustment : detail,
+                                              now.wall, p.due, s, p.originalDue, p.taskId, p.revision});
     if (state.logs.size() > 100)
         state.logs.resize(100);
 }
@@ -126,6 +131,7 @@ bool Engine::cycleWarning() {
     return true;
 }
 TickResult Engine::tick(Snapshot now, Reconcile reason) {
+    dispatchCandidates_.clear();
     TickResult out;
     if (reason != Reconcile::Normal) {
         // Even disabled one-off tasks keep their local date/time when the Windows zone changes.
@@ -170,19 +176,41 @@ TickResult Engine::tick(Snapshot now, Reconcile reason) {
         clearWarnings();
         out.changed = true;
     }
+    // Remove invalid members before testing deadlines, including non-selected warning groups.
+    auto prune = [&](Group &g) {
+        std::erase_if(g.keys, [&](const auto &key) {
+            auto p = std::find_if(state.pending.begin(), state.pending.end(),
+                                  [&](const auto &v) { return v.key == key; });
+            const auto *t = p == state.pending.end() ? nullptr : task(p->taskId);
+            return !t || !t->enabled || t->revision != p->revision;
+        });
+    };
+    if (active) {
+        prune(*active);
+        if (active->keys.empty())
+            active.reset();
+    }
+    for (auto &g : otherWarnings)
+        prune(g);
+    std::erase_if(otherWarnings, [](const auto &g) { return g.keys.empty(); });
     auto dispatchGroup = [&](const Group &group) {
-        for (const auto &key : group.keys)
+        for (const auto &key : group.keys) {
+            auto p = std::find_if(state.pending.begin(), state.pending.end(),
+                                  [&](const auto &v) { return v.key == key; });
+            if (p != state.pending.end())
+                dispatchCandidates_.push_back(*p);
             if (finish(key, Status::Requesting, now, ""))
                 out.dispatch.push_back(key);
+        }
         out.changed = true;
     };
     if (!state.settings.paused) {
-        if (active && active->monotonicDue <= now.steady) {
+        if (active && active->monotonicDue <= now.steady && active->due <= now.wall) {
             dispatchGroup(*active);
             active.reset();
         }
         for (auto it = otherWarnings.begin(); it != otherWarnings.end();) {
-            if (it->monotonicDue <= now.steady) {
+            if (it->monotonicDue <= now.steady && it->due <= now.wall) {
                 dispatchGroup(*it);
                 it = otherWarnings.erase(it);
             } else
@@ -229,13 +257,15 @@ TickResult Engine::tick(Snapshot now, Reconcile reason) {
             if (it == state.pending.end() || it->due <= now.wall || it->due > now.wall + Minute)
                 break;
             Time original = it->due;
-            Time deadline = std::max(original, now.wall + Minute);
+            Time deadline = reason == Reconcile::Normal ? original : std::max(original, now.wall + Minute);
             Group group{{}, deadline, now.steady + (deadline - now.wall)};
             for (auto &p : state.pending)
                 if (!p.warned && p.due == original) {
                     p.warned = true;
                     p.due = deadline;
                     p.monotonicDue = group.monotonicDue;
+                    if (deadline != original)
+                        p.adjustment = "启动、恢复或调时后不足一分钟，补足 60 秒提醒";
                     group.keys.push_back(p.key);
                 }
             if (!active)
@@ -274,6 +304,7 @@ bool Engine::snooze(Snapshot now, int minutes) {
         it->monotonicDue = now.steady + minutes * Minute;
         it->warned = false;
         it->detached = true;
+        it->adjustment = "用户推迟 " + std::to_string(minutes) + " 分钟";
     }
     active.reset();
     promoteWarning();
@@ -330,6 +361,8 @@ void Engine::upsert(Task value, Snapshot now) {
             value.lastHandledDay = existing->lastHandledDay;
             value.completed = existing->completed;
         }
+        // Editing a stale draft must never restore a task disabled after the editor opened.
+        value.enabled = existing->enabled;
         *existing = std::move(value);
         if (!existing->enabled) {
             std::string id = existing->id;
@@ -349,19 +382,56 @@ void Engine::enable(const std::string &id, bool value, Snapshot now) {
     auto *t = task(id);
     if (!t)
         return;
+    if (t->enabled == value)
+        return;
     t->enabled = value;
     if (!value) {
         cancelTaskWarning(id, now, "停用任务");
         std::erase_if(state.pending, [&](const auto &p) { return p.taskId == id; });
     } else
         fill(now);
+    state.logs.insert(state.logs.begin(), Log{t->id + "/switch/" + std::to_string(now.wall),
+                                              t->name,
+                                              value ? "手动启用任务" : "手动停用任务，保持停用直到手动开启",
+                                              now.wall,
+                                              0,
+                                              value ? Status::Enabled : Status::Disabled,
+                                              {},
+                                              t->id,
+                                              t->revision});
+    if (state.logs.size() > 100)
+        state.logs.resize(100);
 }
-void Engine::result(const std::vector<std::string> &keys, bool success, const std::string &detail) {
+void Engine::result(const std::vector<std::string> &keys, bool success, const std::string &detail,
+                    Time requestedAt) {
     for (auto &l : state.logs)
         if (l.status == Status::Requesting && std::find(keys.begin(), keys.end(), l.key) != keys.end()) {
             l.status = success ? Status::Requested : Status::Failed;
-            l.detail = detail;
+            l.detail = l.detail.empty() ? detail : l.detail + "；" + detail;
+            if (requestedAt)
+                l.at = requestedAt;
         }
+}
+std::vector<std::string> Engine::authorizeDispatch(const std::vector<std::string> &keys, Snapshot now) {
+    std::vector<std::string> allowed;
+    for (const auto &p : dispatchCandidates_) {
+        const auto *t = task(p.taskId);
+        if (std::find(keys.begin(), keys.end(), p.key) != keys.end() && !state.settings.paused && t &&
+            t->enabled && t->revision == p.revision && now.wall >= p.due && now.steady >= p.monotonicDue)
+            allowed.push_back(p.key);
+    }
+    dispatchCandidates_.clear();
+    for (auto &l : state.logs) {
+        if (l.status != Status::Requesting || std::find(keys.begin(), keys.end(), l.key) == keys.end())
+            continue;
+        if (std::find(allowed.begin(), allowed.end(), l.key) != allowed.end()) {
+            l.at = now.wall;
+        } else {
+            l.status = Status::Cancelled;
+            l.detail = "提交前复核未通过，没有请求关机";
+        }
+    }
+    return allowed;
 }
 Time Engine::nextWait(Snapshot now) const {
     Time wait = Day;
@@ -386,6 +456,6 @@ const Occurrence *Engine::next() const {
                               [](const auto &a, const auto &b) { return a.due < b.due; });
 }
 Time Engine::remaining(Snapshot now) const {
-    return active ? std::max(Time{0}, active->monotonicDue - now.steady) : 0;
+    return active ? std::max({Time{0}, active->monotonicDue - now.steady, active->due - now.wall}) : 0;
 }
 } // namespace evening

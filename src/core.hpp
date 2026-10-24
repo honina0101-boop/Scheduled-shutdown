@@ -11,7 +11,7 @@ using Time = int64_t; // milliseconds
 constexpr Time Minute = 60000;
 constexpr Time Day = 86400000;
 enum class Kind { Once, Weekly, Countdown };
-enum class Status { Cancelled, Snoozed, Missed, Requesting, Requested, Failed };
+enum class Status { Cancelled, Snoozed, Missed, Requesting, Requested, Failed, Enabled, Disabled };
 enum class Reconcile { Normal, Startup, Resume, TimeChange };
 struct Snapshot {
     Time wall = 0, steady = 0;
@@ -51,11 +51,15 @@ struct Occurrence {
     // Runtime-only. Never restore an expired warning after a restart.
     Time monotonicDue = 0;
     bool warned = false;
+    std::string adjustment;
 };
 struct Log {
     std::string key, name, detail;
     Time at = 0, due = 0;
     Status status = Status::Missed;
+    std::optional<Time> originalDue;
+    std::string taskId;
+    int revision = 0;
 };
 struct Settings {
     bool paused = false, autostart = false, sound = true, force = false;
@@ -78,6 +82,7 @@ struct TickResult {
 
 class Engine {
     const Calendar *calendar_;
+    std::vector<Occurrence> dispatchCandidates_;
     bool finish(const std::string &key, Status status, Snapshot now, const std::string &detail);
     void append(const Occurrence &p, Status s, Snapshot now, const std::string &detail = {});
     bool fill(Snapshot now);
@@ -98,7 +103,9 @@ class Engine {
     void upsert(Task value, Snapshot now);
     void erase(const std::string &id, Snapshot now);
     void enable(const std::string &id, bool value, Snapshot now);
-    void result(const std::vector<std::string> &keys, bool success, const std::string &detail);
+    void result(const std::vector<std::string> &keys, bool success, const std::string &detail,
+                Time requestedAt = 0);
+    std::vector<std::string> authorizeDispatch(const std::vector<std::string> &keys, Snapshot now);
     Time nextWait(Snapshot now) const;
     const Occurrence *next() const;
     Time remaining(Snapshot now) const;

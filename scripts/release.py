@@ -4,11 +4,12 @@ import argparse,hashlib,json,shutil,subprocess,zipfile
 ROOT=Path(__file__).resolve().parents[1]
 parser=argparse.ArgumentParser()
 parser.add_argument('--build-dir',default='build')
+parser.add_argument('--dist-dir',default='dist',help='Output directory; use a fresh directory while an older portable EXE is running')
 parser.add_argument('--msvc',action='store_true')
 parser.add_argument('--reuse-exe',action='store_true',help='Package the already reviewed EXE without modifying its bytes')
 args=parser.parse_args()
 build=(ROOT/args.build_dir).resolve()
-dist=ROOT/'dist';dist.mkdir(exist_ok=True)
+dist=ROOT/args.dist_dir;dist.mkdir(parents=True,exist_ok=True)
 source=build/'Evenfall.exe';target=dist/'Evenfall.exe'
 if args.reuse_exe:
     assert target.exists(),'Reviewed EXE is missing'
@@ -21,12 +22,16 @@ else:
     elif (build/'Evenfall.pdb').exists():
         shutil.copy2(build/'Evenfall.pdb',dist/'Evenfall.pdb')
 assert 0<target.stat().st_size<=5_000_000,'EXE exceeds 5 MB budget'
-usage="""晚安 · 定时关机 1.0.0
+usage="""晚安 · 定时关机 1.0.1
 直接双击 Evenfall.exe，免安装。
 
 新建任务：执行一次、按星期重复，或多少分钟后关机。
 右下角提前一分钟提醒，可取消本次，或推迟 10 / 30 / 60 分钟。
 取消只影响本次，重复计划保留，重启软件也不会恢复本次任务。
+关闭任务右侧开关会持续停用，必须手动开启，不会跨午夜恢复。
+升级前停止 Windows 计划任务中的旧版并退出托盘，确认所有旧进程退出，再复制备份 %LOCALAPPDATA%\\Evenfall。
+新版数据格式为 v2；回退旧版时须恢复升级前备份。
+建议仅使用程序内登录自启动，避免与非交互式计划任务重复运行。
 关闭窗口进入托盘，托盘右键“退出”停止软件。
 睡眠、软件停止或暂停错过时间时，跳过，不主动唤醒电脑。
 锁屏时任务继续；普通关机可能被未保存文档阻止。
@@ -42,7 +47,7 @@ usage="""晚安 · 定时关机 1.0.0
 """
 (dist/'使用说明.txt').write_text(usage,encoding='utf-8-sig')
 shutil.copy2(ROOT/'THIRD-PARTY-NOTICES.txt',dist/'THIRD-PARTY-NOTICES.txt')
-portable=dist/'晚安-定时关机-1.0.0.zip'
+portable=dist/'晚安-定时关机-1.0.1.zip'
 licenses=['JSON-LICENSE.txt','GCC-RUNTIME-EXCEPTION.txt','GPL-3.0.txt','MINGW-LICENSE.txt']
 project_license=ROOT/'LICENSE'
 with zipfile.ZipFile(portable,'w',zipfile.ZIP_DEFLATED,compresslevel=9) as archive:
@@ -50,7 +55,7 @@ with zipfile.ZipFile(portable,'w',zipfile.ZIP_DEFLATED,compresslevel=9) as archi
     if project_license.exists():archive.write(project_license,'LICENSE')
     for name in licenses:
         if (ROOT/'third_party'/name).exists():archive.write(ROOT/'third_party'/name,'licenses/'+name)
-source_archive=dist/'Evenfall-1.0.0-source.zip'
+source_archive=dist/'Evenfall-1.0.1-source.zip'
 with zipfile.ZipFile(source_archive,'w',zipfile.ZIP_DEFLATED,compresslevel=9) as archive:
     for directory in ['src','tests','resources','scripts','third_party','docs']:
         for file in sorted((ROOT/directory).rglob('*')):
