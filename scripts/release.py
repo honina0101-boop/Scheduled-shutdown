@@ -22,32 +22,31 @@ else:
     elif (build/'Evenfall.pdb').exists():
         shutil.copy2(build/'Evenfall.pdb',dist/'Evenfall.pdb')
 assert 0<target.stat().st_size<=5_000_000,'EXE exceeds 5 MB budget'
-usage="""晚安 · 定时关机 1.0.1
-直接双击 Evenfall.exe，免安装。
+usage="""晚安 · 定时关机 1.1.0
+解压后双击 Evenfall.exe，放在固定、本地、未加密目录。
 
-新建任务：执行一次、按星期重复，或多少分钟后关机。
-右下角提前一分钟提醒，可取消本次，或推迟 10 / 30 / 60 分钟。
-取消只影响本次，重复计划保留，重启软件也不会恢复本次任务。
-关闭任务右侧开关会持续停用，必须手动开启，不会跨午夜恢复。
-升级前停止 Windows 计划任务中的旧版并退出托盘，确认所有旧进程退出，再复制备份 %LOCALAPPDATA%\\Evenfall。
-新版数据格式为 v2；回退旧版时须恢复升级前备份。
-建议仅使用程序内登录自启动，避免与非交互式计划任务重复运行。
-关闭窗口进入托盘，托盘右键“退出”停止软件。
-睡眠、软件停止或暂停错过时间时，跳过，不主动唤醒电脑。
-锁屏时任务继续；普通关机可能被未保存文档阻止。
-设置中可启用登录启动、提示音、主题、强制关机或预览提醒。
-强制关机可能丢失未保存内容，建议保持默认普通关机。
-开启登录启动前请把 EXE 放在固定目录，移动后重新关闭并开启。
-默认不开机自启动，没有预置任务。
-数据：%LOCALAPPDATA%\\Evenfall（仅当前用户）
-保存异常会暂停自动任务；重试保存后，检查并恢复任务。
+设置 → 未登录也执行任务：创建当前账户的免保存密码 S4U 后台任务，可能需要管理员授权。
+设置 → 登录后启动托盘界面：登录后显示托盘，双击打开主窗口并连接后台。
+两个开关独立，新用户默认关闭。手动运行仍可使用。
+未登录／锁屏时不能操作桌面提醒，但后台仍会按计划关闭整台电脑。
 
-软件离线运行，不上传数据。本地发布未做代码签名。
-许可见 THIRD-PARTY-NOTICES.txt 和 licenses 文件夹。
+新建一次、星期重复或倒计时任务。提前一分钟提醒，取消本次或推迟 10／30／60 分钟。
+关闭任务右侧开关会持续停用，必须手动开启；取消本次只跳过该次计划日期。
+关闭主窗口进入托盘。“退出界面，后台继续”不停止任务；“停止后台并退出”停止当次运行。
+关闭后台开机启动不结束已在运行的后台。暂停全部会持久化，须手动恢复。
+登录／重新打开界面不会重置倒计时。睡眠或后台停止错过的任务跳过，不主动唤醒电脑。
+普通关机可能被未保存文档阻止；强制关机可能丢失未保存内容。
+
+后台独占数据，界面通过本机通信操作。未连接时可重试，不会启动第二个调度器。
+S4U 不保存密码，不能读取网络或加密文件，受 Windows 账户及系统策略限制。
+升级前退出旧程序及后台，备份整个 %LOCALAPPDATA%\\Evenfall 和旧 EXE 再替换。
+数据格式为 v3；回退旧版须先停止并停用新版后台，再恢复升级前备份。
+程序离线运行，未做代码签名。使用说明、验证边界及交接记录见项目 README 和 docs。
+许可见 LICENSE、THIRD-PARTY-NOTICES.txt 和 licenses 文件夹。
 """
 (dist/'使用说明.txt').write_text(usage,encoding='utf-8-sig')
 shutil.copy2(ROOT/'THIRD-PARTY-NOTICES.txt',dist/'THIRD-PARTY-NOTICES.txt')
-portable=dist/'晚安-定时关机-1.0.1.zip'
+portable=dist/'晚安-定时关机-1.1.0.zip'
 licenses=['JSON-LICENSE.txt','GCC-RUNTIME-EXCEPTION.txt','GPL-3.0.txt','MINGW-LICENSE.txt']
 project_license=ROOT/'LICENSE'
 with zipfile.ZipFile(portable,'w',zipfile.ZIP_DEFLATED,compresslevel=9) as archive:
@@ -55,7 +54,7 @@ with zipfile.ZipFile(portable,'w',zipfile.ZIP_DEFLATED,compresslevel=9) as archi
     if project_license.exists():archive.write(project_license,'LICENSE')
     for name in licenses:
         if (ROOT/'third_party'/name).exists():archive.write(ROOT/'third_party'/name,'licenses/'+name)
-source_archive=dist/'Evenfall-1.0.1-source.zip'
+source_archive=dist/'Evenfall-1.1.0-source.zip'
 with zipfile.ZipFile(source_archive,'w',zipfile.ZIP_DEFLATED,compresslevel=9) as archive:
     for directory in ['src','tests','resources','scripts','third_party','docs']:
         for file in sorted((ROOT/directory).rglob('*')):

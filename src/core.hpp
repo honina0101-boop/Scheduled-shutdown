@@ -42,6 +42,7 @@ struct Task {
     int day = 0, minute = 23 * 60, weekdays = 127, minutes = 60;
     int lastHandledDay = -2000000;
     Time onceDue = 0;
+    uint64_t editVersion = 0;
 };
 struct Occurrence {
     std::string key, taskId;
@@ -64,12 +65,14 @@ struct Log {
 struct Settings {
     bool paused = false, autostart = false, sound = true, force = false;
     std::string theme = "system";
+    bool background = false;
 };
 struct State {
     Settings settings;
     std::vector<Task> tasks;
     std::vector<Occurrence> pending;
     std::vector<Log> logs;
+    uint64_t version = 0;
 };
 struct Group {
     std::vector<std::string> keys;

@@ -343,6 +343,7 @@ void Engine::cancelTaskWarning(const std::string &id, Snapshot now, const std::s
 }
 void Engine::upsert(Task value, Snapshot now) {
     if (auto *existing = task(value.id)) {
+        value.editVersion = existing->editVersion + 1;
         bool changed = existing->kind != value.kind;
         if (!changed) {
             if (value.kind == Kind::Weekly)
@@ -369,8 +370,10 @@ void Engine::upsert(Task value, Snapshot now) {
             cancelTaskWarning(id, now, "停用任务");
             std::erase_if(state.pending, [&](const auto &p) { return p.taskId == id; });
         }
-    } else
+    } else {
+        value.editVersion = 1;
         state.tasks.push_back(std::move(value));
+    }
     fill(now);
 }
 void Engine::erase(const std::string &id, Snapshot now) {
@@ -385,6 +388,7 @@ void Engine::enable(const std::string &id, bool value, Snapshot now) {
     if (t->enabled == value)
         return;
     t->enabled = value;
+    ++t->editVersion;
     if (!value) {
         cancelTaskWarning(id, now, "停用任务");
         std::erase_if(state.pending, [&](const auto &p) { return p.taskId == id; });

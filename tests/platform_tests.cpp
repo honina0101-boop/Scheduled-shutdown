@@ -127,6 +127,10 @@ int main() {
             input >> old;
         }
         old["schemaVersion"] = 1;
+        old.erase("version");
+        old["settings"].erase("background");
+        for (auto &task : old["tasks"])
+            task.erase("editVersion");
         for (auto &log : old["logs"]) {
             log.erase("originalDue");
             log.erase("taskId");
@@ -142,8 +146,24 @@ int main() {
                   migrated.state.logs[0].due == e.state.logs[0].due,
               "legacy logs stay truthful without fabricated original time");
         check(legacy.save(migrated.state, error) && !legacy.load().recovered, "legacy upgrade roundtrip");
+        check(!migrated.state.settings.background && migrated.state.version == 0,
+              "legacy startup maps to UI only");
         check(formatTime(nextMidnight, true, true).find(L"00:00:00") != std::wstring::npos,
               "history includes seconds at midnight");
+        State startupFlags;
+        startupFlags.settings.autostart = true;
+        startupFlags.settings.background = false;
+        Storage flags(path / L"startup-flags");
+        check(flags.save(startupFlags, error), "startup flags save");
+        auto firstFlags = flags.load().state.settings;
+        check(firstFlags.autostart && !firstFlags.background, "UI login startup independent from background");
+        startupFlags.settings.autostart = false;
+        startupFlags.settings.background = true;
+        check(flags.save(startupFlags, error), "background flag save");
+        auto secondFlags = flags.load().state.settings;
+        check(secondFlags.background && !secondFlags.autostart, "background startup independent from UI");
+        check(disabled.state.tasks[0].editVersion == midnight.state.tasks[0].editVersion,
+              "task edit version survives persistence");
         std::cout << "PASS: " << checks << " persistence/platform assertions\n";
         return 0;
     } catch (const std::exception &e) {

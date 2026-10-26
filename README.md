@@ -1,127 +1,107 @@
-# 晚安 · 定时关机（Evenfall 1.0.1）
+# 晚安 · 定时关机（Evenfall 1.1.0 自测预发布）
 
-一款离线运行的 Windows 10/11 64 位定时关机工具。蓝紫主色、浅深色主题、托盘常驻，以及可以取消或推迟的右下角提醒。
+**本包按用户要求直接打包，最终功能验证由用户自行完成。此前构建的测试结果不作为本包验收结果；冷启动未登录关机尚未验收。**
 
-![晚安 · 定时关机界面](docs/preview.png)
+Windows 10/11 64 位离线关机工具。单个 EXE、浅深色主题、托盘常驻；支持一次、按星期重复和倒计时任务。
 
-上图为模拟任务示例，首次运行没有预置任务。
+![界面示例，使用模拟任务](docs/preview.png)
 
-## 下载（普通用户）
+## 下载
 
-无需编译或安装。推荐下载 [Windows 64 位便携包](https://github.com/honina0101-boop/Scheduled-shutdown/releases/download/v1.0.1/Evenfall-1.0.1-win-x64.zip)，解压后双击 **Evenfall.exe**。
+推荐下载 [Windows 64 位便携包](https://github.com/honina0101-boop/Scheduled-shutdown/releases/download/v1.1.0/Evenfall-1.1.0-win-x64.zip)，解压后运行 **Evenfall.exe**。也可下载 [单文件 EXE](https://github.com/honina0101-boop/Scheduled-shutdown/releases/download/v1.1.0/Evenfall.exe)，或查看 [所有版本](https://github.com/honina0101-boop/Scheduled-shutdown/releases)。GitHub 自动提供的 Source code 是源码，需要自行编译。当前发布未做代码签名。
 
-也可以下载 [单文件 EXE](https://github.com/honina0101-boop/Scheduled-shutdown/releases/download/v1.0.1/Evenfall.exe)（小于 5 MB），或访问 [版本下载页](https://github.com/honina0101-boop/Scheduled-shutdown/releases/latest)。
+## 未登录也能执行，登录后显示托盘
 
-GitHub「Code → Download ZIP」和版本页自动提供的「Source code」是源码，普通用户请选择上面的便携包或 EXE。程序目前未做代码签名。
+1. 把 EXE 放在固定、本地、未加密的目录，双击运行。
+2. 在设置中开启 **未登录也执行任务**，确认后允许管理员设置。程序创建当前账户的 S4U 后台计划任务，不询问或保存 Windows 登录密码。
+3. 开启 **登录后启动托盘界面**。登录后仅显示托盘；双击托盘或手动运行 EXE 打开主窗口，连接同一个后台。
+4. 创建关机任务。未登录、注销、关闭界面均不会停止后台；登录／解锁时正在倒计时，会显示剩余时间，目标时间不会因为打开界面而延后。
 
-## 升级与开发记录
+两个启动设置独立，普通新用户默认关闭。手动运行仍可启动当前用户的后台进程使用软件。关闭“未登录也执行任务”只关闭后台开机启动，不结束已经运行的后台；需要停止当次运行时使用托盘的“停止后台并退出”。
 
-升级到 1.0.1 前，先停止仍在运行旧版的 Windows 计划任务，再从托盘退出旧版，确认所有旧进程退出后复制备份 `%LOCALAPPDATA%\Evenfall`，再替换 EXE。任务和旧日志会保留；新版本使用 schemaVersion 2，回退 1.0.0 时须恢复升级前备份，不能直接让旧版读取新版数据。
+**未登录或锁屏时无法操作桌面提醒，但后台仍按时执行，关机作用于整台电脑。** 普通关机允许未保存应用阻止；强制模式可能丢失未保存内容。
 
-开发节点、原因、验证结果和未验证事项见 [开发交接记录](docs/HANDOFF.md)。每次代码变更须同步追加记录。
+S4U 不能访问网络或加密文件，并受账户批处理登录、关机权限及组织策略限制。设置失败会明确报错，不会改用 SYSTEM 或保存密码。使用其他账户进行管理员授权会被拒绝，避免把后台改为其他账户运行。
 
-## 使用
+## 使用与调度规则
 
-直接运行发布目录的 **Evenfall.exe**，无需安装。首次运行没有任务，默认关闭登录启动和强制关机。
+- 支持一次任务、任意星期组合、30／60／120 分钟或自定义倒计时；可命名、编辑、停用和删除多个任务。
+- 提前 60 秒提醒，可取消本次或推迟 10／30／60 分钟。相同时间合并；不同提醒组独立执行、可以切换。
+- 停用持续有效，必须手动开启；取消只跳过该次计划日期。23:59 取消紧接着的每天 00:00，下一次为再下一天 00:00，不增加 24 小时冷却。
+- 正常提醒保持原时间，单调时钟与系统时间均到达目标才请求关机，允许系统调度造成短暂延迟。
+- 后台启动／睡眠恢复时，已过期任务跳过；尚未来到但不足一分钟则补足 60 秒提醒。仅连接或重新打开界面不会重新安排倒计时。
+- 不主动唤醒电脑。暂停全部任务会持久化；恢复只处理未来任务，不补执行暂停期间错过的任务。
+- 关闭主窗口进入托盘；“退出界面，后台继续”保留调度。“停止后台并退出”结束当前后台运行，保留启动设置，未来开机或手动启动仍可恢复。
+- 记录区区分原计划、本次目标、实际请求时间；“已请求关机”仅表示 Windows 接受请求。旧日志缺少原计划时显示“旧版未记录”。
 
-1. 点击「新建任务」，选择执行一次、按星期重复，或倒计时。
-2. 设置日期／24 小时时间；重复任务可任意选择周一至周日。
-3. 保存后首页显示下一次关机。关闭主窗口会留在托盘继续执行。
-4. 关机前 60 秒提醒。「取消本次」跳过这次，「推迟」可选 10／30／60 分钟。
-5. 托盘右键「退出」才会停止软件。
+![模拟提醒及卡片内推迟选项](docs/reminder.png)
 
-「设置」提供登录后启动、提示音、强制关机、主题、提醒预览和数据目录入口。开启登录启动前，建议把 EXE 放在固定目录；移动程序后重新关闭并开启该选项。Windows 的启动应用设置也能单独禁用启动项。
+## 界面与后台连接
 
-## 调度规则
+后台独占任务数据并负责保存和关机。界面通过仅限本机所属账户的命名管道连接；界面退出不影响后台。保存成功才确认操作成功，断线不会自动重发修改命令。
 
-- 同一数据目录使用跨 Windows 会话的独占文件锁，只允许一个新版实例调度。锁定失败时不启动调度。旧版不遵守该锁，升级必须退出所有旧副本；建议仅用程序内登录自启动，避免同时设置非交互式计划任务。
+后台未连接时显示状态和重试入口，不能修改任务；旧组件不兼容时提示退出旧版。多个界面不会创建多个调度器。编辑期间任务被其他界面修改时拒绝覆盖，可在编辑器点击“重新载入”。
 
-- 多个任务同一目标时间时合并提醒；取消／推迟作用于这组任务的本次触发。不同时间的提醒独立计时，同时出现时可以「切换」查看，取消一组不会延后另一组。
-- 改名保留已经取消的状态。改变时间／星期会重新安排该任务；保存倒计时任务会从现在重新计时。
-- 任务右侧开关关闭后持续停用，必须手动开启；不会跨午夜自动恢复。停用会清除该任务的提醒和推迟项。
-- 每天 00:00 的任务在前一天 23:59 取消，跳过的是紧接着的午夜，下一次为再下一天 00:00；不使用额外的 24 小时冷却。
-- 正常提醒保持设定时间；系统时间和倒计时均到达目标才提交请求，允许系统调度带来的短暂延迟。记录区分别显示原计划、本次目标、实际请求时间（秒），旧记录缺少原计划时显示“旧版未记录”。
-- 取消一次任务后结束；重复任务继续等待下一个选中日期。结果保存后，重启软件不会恢复本次任务。
-- 睡眠、软件未运行或暂停导致错过时间时，跳过这次，不补关机，也不主动唤醒电脑。
-- 启动／恢复时距离目标不足 60 秒，会给出完整 60 秒提醒，本次时间顺延。
-- 暂停会关闭当前提醒；恢复只处理未来任务，仍未到期的任务重新提醒。锁屏不暂停调度，锁屏时无法操作桌面提醒。
-- 普通关机可能被未保存文档的应用阻止；强制模式可能丢失未保存内容。
-- 「已请求关机」表示 Windows 接受请求，最终结果由系统决定。请求登记后进程中断的记录显示「结果待确认」，不会自动重试。
+## 升级、数据与回退
 
-提醒示例（模拟任务，推迟选项在卡片内展开）：
+升级前退出旧版及其后台副本，备份整个 `%LOCALAPPDATA%\Evenfall` 和旧 EXE，再替换固定路径的程序。启用新版后台功能时，会备份并迁移当前账户、相同程序路径的受支持旧计划任务，不处理无关任务。
 
-![提醒与推迟选项](docs/reminder.png)
+任务、设置和最近 100 条记录保存在当前用户目录。1.1.0 读取格式 1／2／3，保存为 **schemaVersion 3**。旧“autostart”仅迁移为界面登录启动，不擅自开启未登录关机。回退旧版本时须先停止新版后台、停用新版后台启动入口，再恢复升级前的数据和 EXE；旧版不能读取新版格式。
 
-## 数据
+保存使用临时文件、刷新和原子替换。损坏恢复及保存失败会暂停自动执行；“重试保存”成功后仍需手动恢复。普通原子备份只保留最近一份，不能替代独立升级备份。程序没有联网更新、账号或遥测。
 
-当前用户的数据在 **%LOCALAPPDATA%\Evenfall**。保存采用临时文件、刷新和原子替换，保留上一份备份。配置损坏时恢复备份并暂停任务，另保留损坏文件；写入失败也会暂停自动执行。「设置 → 重试保存」成功后仍保持暂停，检查任务后手动恢复。
-
-任务、设置和最近 100 条记录保存在本机。程序没有联网更新、账号、遥测或后台服务。
+开发节点和修改原因见 [交接记录](docs/HANDOFF.md)；验证结果见 [验证报告](docs/QA-REPORT.md)。详细本机配置及备份不放入仓库或公开下载包。
 
 ## 构建
 
-源码使用 C++20、Win32、Direct2D、DirectWrite 和 nlohmann/json 3.12.0。CMake 支持 MSVC 静态运行库，也支持便携 MinGW 静态构建。
+C++20、Win32、Direct2D、DirectWrite，使用 Windows 系统组件与固定的 nlohmann/json 3.12.0。开发机需要 Python 3。
 
-### 便携工具链
-
-开发机需要 Python 3。在项目目录执行：
-
-~~~powershell
+```powershell
 python scripts/bootstrap.py
 powershell -ExecutionPolicy Bypass -File scripts/build.ps1
-~~~
+```
 
-工具链为固定版本 w64devkit 2.10.0，下载到项目的 .tools，不会注册或安装到系统。JSON 头文件随源码提供。可用 build.ps1 的 -Python 参数指定 Python 完整路径。
+固定版本的便携工具链只下载到项目 `.tools`，不会注册到系统。也支持 Visual Studio 2022 Build Tools 的 C++／Windows SDK／CMake：
 
-### MSVC
-
-安装 Visual Studio 2022 Build Tools 的 C++ 工具、Windows SDK 和 CMake，然后：
-
-~~~powershell
+```powershell
 cmake -S . -B build-msvc -G "Visual Studio 17 2022" -A x64
 cmake --build build-msvc --config Release
 ctest --test-dir build-msvc -C Release --output-on-failure
 python scripts/release.py --build-dir build-msvc/Release --msvc
-~~~
+```
 
-发布包在 dist，调试符号独立保存。发布脚本强制检查 EXE 不超过 5,000,000 字节。
+静态链接运行库，调试符号单独保存，发布 EXE 强制检查不超过 5,000,000 字节。
 
-## 验证与开发模式
+## 开发与验证
 
-~~~powershell
+```powershell
 build\Evenfall.exe --simulate
 build\Evenfall.exe --smoke-test "build\ui-smoke"
+python tests/runtime_integration.py build/Evenfall.exe build/runtime-tests
+build\Evenfall.exe --client-test "build\client-smoke"
 python scripts/qa.py --build-dir build --exe dist/Evenfall.exe
-~~~
+```
 
-模拟模式默认使用独立的 Simulation 数据目录，禁止修改 Windows 自启动，不调用系统关机。界面自检强制模拟，并把数据放在指定输出目录内。--data-dir 可显式指定隔离目录；--tray 启动到托盘。
+`--simulate` 默认使用独立 Simulation 目录；`--smoke-test` 和 `--client-test` 强制隔离模拟。模拟后台不调用真实关机，也不修改登录启动项。独立界面测试退出后后台可能仍运行，测试控制器负责发送停止命令。
 
-自动测试覆盖重复计划、跨午夜、合并、取消／推迟、改名、重启、恢复、调时、夏令时、输入校验、损坏恢复、写入失败和提交前保存。实际关机、Windows 11 真机和多个物理显示器的验证步骤见 [测试说明](docs/TESTING.md)。本地发布未做代码签名。
+可选的 `tests/s4u_integration.py` 需要管理员权限，只创建独立模拟配置的临时 S4U 任务，检查跨进程通信和异常重启，完成后清理临时任务。它不证明冷启动停留登录界面时的真实关机已经验收。专用环境步骤见 [测试说明](docs/TESTING.md)。
 
-## 文件结构
+入口：`--engine` 运行纯后台，`--ui` 运行界面，`--tray` 启动到托盘，`--data-dir` 指定数据目录。界面默认连接后台，后台启动入口由软件设置管理，不应再手动添加运行普通界面的非交互式计划任务。
 
-- src/core.*：独立调度引擎，可注入日历及时间快照。
-- src/platform.*：Windows 时区、存储、自启动、权限和关机执行器。
-- src/ui.hpp、src/app.cpp：绘图、主题、窗口、键盘、托盘和提醒。
-- tests：调度及 Windows 持久化测试。
-- scripts：工具准备、构建、打包及资源占用验证。
-- third_party：固定 JSON 头文件与第三方许可证。
+## 发布
 
-JSON 使用 MIT 许可；便携构建所含 GCC 运行库适用 GCC Runtime Library Exception，相关文本随便携包提供。
+```powershell
+python scripts/release.py --dist-dir dist/v1.1.0
+python scripts/qa.py --exe dist/v1.1.0/Evenfall.exe
+python scripts/release.py --dist-dir dist/v1.1.0 --reuse-exe
+python scripts/publish_release.py --dist-dir dist/v1.1.0 --prepare-only
+python scripts/publish_release.py --dist-dir dist/v1.1.0 --target-sha (git rev-parse HEAD)
+```
+
+用户明确要求跳过最终功能验证时，可在准备和发布命令中添加 `--candidate`，只允许发布为待验收的预发布版本，不引用旧 QA 报告。
+
+正常发布脚本先验证已测 EXE 与 ZIP 的 SHA-256，再上传草稿，四项资产完整后公开。使用本机 Git Credential Manager 或 GH_TOKEN／GITHUB_TOKEN，不输出或保存令牌。运行中的 EXE 无法覆盖时使用独立产物目录，不强行覆盖。
 
 ## 许可证
 
-本项目采用 [MIT License](LICENSE)，第三方组件许可见 [THIRD-PARTY-NOTICES.txt](THIRD-PARTY-NOTICES.txt)。
-
-## 发布到 GitHub Releases
-
-先构建、运行模拟验证，再发布已验证的产物。发布脚本通过本机 Git Credential Manager 或 GH_TOKEN / GITHUB_TOKEN 认证，不会输出或保存令牌。Windows 便携包、单文件 EXE、源码 ZIP 和 SHA-256 校验文件会先上传到草稿版本，完整上传后再公开。
-
-~~~powershell
-python scripts/qa.py --build-dir build --exe dist/Evenfall.exe
-python scripts/release.py --reuse-exe
-python scripts/publish_release.py --prepare-only
-python scripts/publish_release.py --target-sha (git rev-parse HEAD)
-~~~
-
-运行中的旧 EXE 无法覆盖时，可把发布命令改为 `python scripts/release.py --dist-dir dist/v1.0.1`，后续验证、打包及发布均指定同一目录；`publish_release.py` 也支持 `--dist-dir`。不要强行覆盖正在运行的程序。
+[MIT License](LICENSE)；第三方许可见 [THIRD-PARTY-NOTICES.txt](THIRD-PARTY-NOTICES.txt)。JSON 使用 MIT；便携构建包含的 GCC 运行库适用 GCC Runtime Library Exception，相应文本包含在便携 ZIP 中。

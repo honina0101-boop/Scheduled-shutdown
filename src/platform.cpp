@@ -225,13 +225,15 @@ std::filesystem::path defaultDataDirectory() {
     return path / L"Evenfall";
 }
 json encode(const State &s) {
-    json j = {{"schemaVersion", 2},
+    json j = {{"schemaVersion", 3},
+              {"version", s.version},
               {"settings",
                {{"paused", s.settings.paused},
                 {"autostart", s.settings.autostart},
                 {"sound", s.settings.sound},
                 {"force", s.settings.force},
                 {"theme", s.settings.theme}}}};
+    j["settings"]["background"] = s.settings.background;
     j["tasks"] = json::array();
     j["pending"] = json::array();
     j["logs"] = json::array();
@@ -247,7 +249,8 @@ json encode(const State &s) {
                               {"weekdays", t.weekdays},
                               {"minutes", t.minutes},
                               {"lastHandledDay", t.lastHandledDay},
-                              {"onceDue", t.onceDue}});
+                              {"onceDue", t.onceDue},
+                              {"editVersion", t.editVersion}});
     for (const auto &p : s.pending)
         j["pending"].push_back({{"key", p.key},
                                 {"taskId", p.taskId},
@@ -270,12 +273,14 @@ json encode(const State &s) {
     return j;
 }
 State decode(const json &j) {
-    if (j.at("schemaVersion").get<int>() != 1 && j.at("schemaVersion").get<int>() != 2)
+    if (j.at("schemaVersion").get<int>() < 1 || j.at("schemaVersion").get<int>() > 3)
         throw std::runtime_error("unsupported schema");
     State s;
+    s.version = j.value("version", uint64_t{0});
     const auto &a = j.at("settings");
     s.settings = {a.at("paused").get<bool>(), a.at("autostart").get<bool>(), a.at("sound").get<bool>(),
                   a.at("force").get<bool>(), a.at("theme").get<std::string>()};
+    s.settings.background = a.value("background", false);
     if (s.settings.theme != "system" && s.settings.theme != "light" && s.settings.theme != "dark")
         throw std::runtime_error("invalid theme");
     const auto &tasks = j.at("tasks");
@@ -302,6 +307,7 @@ State decode(const json &j) {
         t.minutes = x.at("minutes");
         t.lastHandledDay = x.at("lastHandledDay");
         t.onceDue = x.at("onceDue");
+        t.editVersion = x.value("editVersion", uint64_t{0});
         if (t.id.empty() || t.id.size() > 80 || !ids.insert(t.id).second || t.name.empty() ||
             wide(t.name).size() > 80 || t.revision < 1 || t.revision > 1000000 ||
             t.lastHandledDay < -2000000 || t.lastHandledDay > 3000000 || t.minute < 0 || t.minute >= 1440 ||
@@ -458,9 +464,9 @@ PowerResult requestShutdown(bool force, bool simulate) {
         return {false, L"当前账户没有关机权限，请检查系统策略"};
     }
     Time requestedAt = snapshot().wall;
-    BOOL ok =
-        ExitWindowsEx(EWX_POWEROFF | (force ? EWX_FORCE : 0),
-                      SHTDN_REASON_MAJOR_APPLICATION | SHTDN_REASON_MINOR_OTHER | SHTDN_REASON_FLAG_PLANNED);
+    BOOL ok = InitiateSystemShutdownExW(nullptr, nullptr, 0, force, FALSE,
+                                        SHTDN_REASON_MAJOR_APPLICATION | SHTDN_REASON_MINOR_OTHER |
+                                            SHTDN_REASON_FLAG_PLANNED);
     code = GetLastError();
     AdjustTokenPrivileges(token, FALSE, &previous, 0, nullptr, nullptr);
     CloseHandle(token);
@@ -490,7 +496,7 @@ bool setAutostart(bool enabled, std::wstring &error) {
         RegCreateKeyExW(HKEY_CURRENT_USER, RunKey, 0, nullptr, 0, KEY_SET_VALUE, nullptr, &key, nullptr);
     if (result == ERROR_SUCCESS) {
         if (enabled) {
-            std::wstring command = L"\"" + executablePath() + L"\" --tray";
+            std::wstring command = L"\"" + executablePath() + L"\" --ui --tray";
             if (command.size() > 259) {
                 RegCloseKey(key);
                 error = L"程序路径过长，请移到较短的固定目录。";

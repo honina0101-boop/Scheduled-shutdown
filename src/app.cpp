@@ -1,3 +1,4 @@
+#include "runtime.hpp"
 #include "ui.hpp"
 #include <array>
 #include <commctrl.h>
@@ -5,6 +6,7 @@
 #include <dwmapi.h>
 #include <filesystem>
 #include <fstream>
+#include <memory>
 #include <shellapi.h>
 #include <sstream>
 #include <wincodec.h>
@@ -36,6 +38,9 @@ enum Command {
     Snooze60,
     SnoozeMenu,
     CycleAlert,
+    BackgroundStart,
+    StartBackend,
+    StopBackend,
     EditorOnce = 100,
     EditorWeekly,
     EditorCountdown,
@@ -44,6 +49,7 @@ enum Command {
     Weekend,
     EditorCancel,
     EditorSave,
+    EditorReload,
     Monday = 200,
     Tuesday,
     Wednesday,
@@ -52,7 +58,7 @@ enum Command {
     Saturday,
     Sunday
 };
-constexpr UINT TrayMessage = WM_APP + 1, ShowMessage = WM_APP + 42;
+constexpr UINT TrayMessage = WM_APP + 1, ShowMessage = WM_APP + 42, RemoteMessage = WM_APP + 50;
 class App;
 static App *application = nullptr;
 static LRESULT CALLBACK windowProcedure(HWND, UINT, WPARAM, LPARAM);
@@ -133,17 +139,28 @@ class App {
     std::wstring banner, editorError;
     std::array<HWND, 4> fields{};
     Task draft;
+    bool editingExisting = false;
+    bool remote = true, connected = false, clientTest = false;
+    Time clientDeadline = 0;
+    std::string remoteEpoch;
+    std::wstring operationError;
+    EngineConnection connection;
+    HANDLE setupProcess = nullptr;
+    std::filesystem::path setupResult;
     bool snoozeExpanded = false;
     std::vector<std::string> snoozeKeys;
     App(HINSTANCE h, std::filesystem::path data) : instance(h), storage(std::move(data)) {}
     ~App() {
+        connection.stop();
+        if (setupProcess)
+            CloseHandle(setupProcess);
         release(writer);
         release(graphics);
         if (editorFont)
             DeleteObject(editorFont);
         if (fieldBrush)
             DeleteObject(fieldBrush);
-        if (instanceLock != INVALID_HANDLE_VALUE)
+        if (instanceLock && instanceLock != INVALID_HANDLE_VALUE)
             CloseHandle(instanceLock);
     }
     bool dark() const {
@@ -173,7 +190,145 @@ class App {
                 if (f)
                     InvalidateRect(f, nullptr, TRUE);
     }
+    void receive(const Json &packet) {
+        if (!packet.value("ok", false)) {
+            connected = false;
+            banner = wide(packet.value("error", "后台未连接"));
+            hideWarning();
+            InvalidateRect(main.window, nullptr, FALSE);
+            return;
+        }
+        try {
+            const auto &value = packet.at("snapshot");
+            if (value.at("protocol") != ProtocolVersion || value.at("release") != ReleaseVersion)
+                throw std::runtime_error("界面与后台版本不同，请升级并重启后台");
+            auto epoch = value.at("epoch").get<std::string>();
+            auto state = decode(value.at("state"));
+            if (epoch == remoteEpoch && state.version < engine.state.version)
+                return;
+            auto selected = engine.active ? engine.active->keys : std::vector<std::string>{};
+            auto previousDue = engine.active ? engine.active->due : 0;
+            bool themeChanged = state.settings.theme != engine.state.settings.theme;
+            engine.state = std::move(state);
+            remoteEpoch = epoch;
+            engine.active.reset();
+            engine.otherWarnings.clear();
+            std::vector<Group> groups;
+            for (const auto &item : value.at("groups"))
+                groups.push_back({item.at("keys").get<std::vector<std::string>>(), item.at("due"),
+                                  item.at("monotonicDue")});
+            auto chosen =
+                std::find_if(groups.begin(), groups.end(), [&](const auto &g) { return g.keys == selected; });
+            if (!groups.empty()) {
+                if (chosen == groups.end())
+                    chosen = groups.begin();
+                engine.active = *chosen;
+                groups.erase(chosen);
+                engine.otherWarnings = std::move(groups);
+            }
+            connected = true;
+            blocked = value.at("blocked");
+            banner = operationError.empty() ? wide(value.at("notice").get<std::string>()) : operationError;
+            if (themeChanged)
+                updateTheme();
+            if (engine.active && (engine.active->keys != selected || engine.active->due != previousDue) &&
+                engine.state.settings.sound && !simulate)
+                MessageBeep(MB_ICONINFORMATION);
+            pump();
+        } catch (const std::exception &error) {
+            connected = false;
+            banner = wide(error.what());
+            hideWarning();
+            InvalidateRect(main.window, nullptr, FALSE);
+        }
+    }
+    bool remoteCommand(Json request) {
+        operationError.clear();
+        try {
+            request["version"] = engine.state.version;
+            auto reply = engineRequest(storage.directory, request);
+            if (reply.contains("snapshot"))
+                receive({{"ok", true}, {"snapshot", reply.at("snapshot")}});
+            if (!reply.value("ok", false)) {
+                operationError = wide(reply.value("error", "操作失败，请刷新后重试"));
+                banner = operationError;
+                InvalidateRect(main.window, nullptr, FALSE);
+                return false;
+            }
+            return true;
+        } catch (const std::exception &error) {
+            connected = false;
+            banner = L"连接中断，操作结果待核对：" + wide(error.what());
+            operationError = banner;
+            hideWarning();
+            InvalidateRect(main.window, nullptr, FALSE);
+            return false;
+        }
+    }
+    bool sendTask(const Task &task, bool mustExist = false) {
+        State value;
+        value.tasks.push_back(task);
+        return remoteCommand(
+            {{"op", "upsert"}, {"task", encode(value)["tasks"][0]}, {"mustExist", mustExist}});
+    }
+    void beginBackgroundSetup() {
+        if (simulate || !remote) {
+            banner = L"模拟模式不会修改 Windows 后台启动任务。";
+            InvalidateRect(main.window, nullptr, FALSE);
+            return;
+        }
+        if (!engine.state.settings.background &&
+            MessageBoxW(main.window,
+                        L"启用后，未登录时也会按计划关闭整台电脑。\n\n将创建免保存密码的后台任务；同一账户、"
+                        L"同一路径的旧版任务会先备份再停用。继续？",
+                        L"未登录后台运行", MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2) != IDYES)
+            return;
+        wchar_t temp[MAX_PATH];
+        GetTempPathW(MAX_PATH, temp);
+        setupResult = std::filesystem::path(temp) / (L"Evenfall-setup-" + wide(newId()) + L".json");
+        auto args = L"--setup-background " + std::wstring(engine.state.settings.background ? L"off" : L"on") +
+                    L" --owner-sid " + quoteArgument(ownerSid()) + L" --data-dir " +
+                    quoteArgument(storage.directory.wstring()) + L" --result " +
+                    quoteArgument(setupResult.wstring());
+        auto exe = executablePath();
+        SHELLEXECUTEINFOW execute{sizeof(execute)};
+        execute.fMask = SEE_MASK_NOCLOSEPROCESS;
+        execute.hwnd = main.window;
+        execute.lpVerb = L"runas";
+        execute.lpFile = exe.c_str();
+        execute.lpParameters = args.c_str();
+        execute.nShow = SW_HIDE;
+        if (!ShellExecuteExW(&execute)) {
+            banner = GetLastError() == ERROR_CANCELLED ? L"已取消后台启动设置。"
+                                                       : L"无法申请管理员设置，请稍后重试。";
+        } else {
+            setupProcess = execute.hProcess;
+            banner = L"正在设置后台启动，请稍候…";
+            SetTimer(main.window, 5, 300, nullptr);
+        }
+        InvalidateRect(main.window, nullptr, FALSE);
+    }
+    void pollBackgroundSetup() {
+        if (!setupProcess || WaitForSingleObject(setupProcess, 0) != WAIT_OBJECT_0)
+            return;
+        CloseHandle(setupProcess);
+        setupProcess = nullptr;
+        KillTimer(main.window, 5);
+        try {
+            std::ifstream input(setupResult);
+            Json result;
+            input >> result;
+            banner =
+                result.value("ok", false) ? L"后台启动设置已完成。" : wide(result.value("error", "设置失败"));
+        } catch (...) {
+            banner = L"后台设置未完成，请检查权限后重试。";
+        }
+        DeleteFileW(setupResult.c_str());
+        InvalidateRect(main.window, nullptr, FALSE);
+    }
     bool save() {
+        if (remote)
+            return false;
         std::wstring error;
         if (storage.save(engine.state, error)) {
             blocked = false;
@@ -197,26 +352,25 @@ class App {
         mainClass = L"Evenfall.Main." + suffix;
         editorClass = L"Evenfall.Editor." + suffix;
         warningClass = L"Evenfall.Warning." + suffix;
-        // File sharing rules apply across Windows sessions and elevation levels.
-        // A session-local mutex allowed a scheduled background copy to keep executing
-        // after the interactive copy disabled the same task.
-        std::error_code directoryError;
-        std::filesystem::create_directories(storage.directory, directoryError);
-        if (!directoryError)
-            instanceLock =
-                CreateFileW((storage.directory / L"instance.lock").c_str(), GENERIC_READ | GENERIC_WRITE, 0,
-                            nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
-        if (instanceLock == INVALID_HANDLE_VALUE) {
-            HWND existing = FindWindowW(mainClass.c_str(), nullptr);
-            if (existing)
-                SendMessageW(existing, ShowMessage, 0, 0);
-            else if (!smoke)
-                MessageBoxW(nullptr,
-                            L"无法独占任务数据目录，程序未启动调度。\n\n"
-                            L"请先退出其他会话中的晚安程序，并检查 Windows 计划任务是否仍在运行旧版；"
-                            L"也请确认数据目录可以写入。",
-                            L"晚安 · 启动受阻", MB_OK | MB_ICONWARNING);
-            return false;
+        if (remote) {
+            instanceLock = CreateMutexW(
+                nullptr, FALSE, (L"Local\\Evenfall.UI." + runtimeIdentity(storage.directory)).c_str());
+            DWORD lockError = GetLastError();
+            if (!instanceLock || lockError == ERROR_ALREADY_EXISTS) {
+                HWND existing = FindWindowW(mainClass.c_str(), nullptr);
+                if (existing)
+                    SendMessageTimeoutW(existing, ShowMessage, 0, 0, SMTO_ABORTIFHUNG, 1000, nullptr);
+                return false;
+            }
+        } else {
+            std::error_code error;
+            std::filesystem::create_directories(storage.directory, error);
+            if (!error)
+                instanceLock =
+                    CreateFileW((storage.directory / L"instance.lock").c_str(), GENERIC_READ | GENERIC_WRITE,
+                                0, nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+            if (error || instanceLock == INVALID_HANDLE_VALUE)
+                return false;
         }
         for (auto cls : {mainClass, editorClass, warningClass}) {
             WNDCLASSEXW wc{sizeof(wc)};
@@ -229,11 +383,12 @@ class App {
             if (!RegisterClassExW(&wc))
                 return false;
         }
-        auto loaded = storage.load();
-        engine.state = std::move(loaded.state);
-        banner = loaded.warning;
-        if (!simulate)
-            engine.state.settings.autostart = hasAutostart();
+        if (!remote) {
+            auto loaded = storage.load();
+            engine.state = std::move(loaded.state);
+            banner = loaded.warning;
+        } else
+            banner = L"正在连接后台…";
         RECT work{};
         SystemParametersInfoW(SPI_GETWORKAREA, 0, &work, 0);
         UINT dpi = systemDpi();
@@ -255,8 +410,12 @@ class App {
             ShowWindow(main.window, SW_SHOWNOACTIVATE);
             SetTimer(main.window, 99, 350, nullptr);
         } else {
-            save();
-            pump(Reconcile::Startup);
+            connection.start(storage.directory, simulate, main.window, RemoteMessage);
+            if (clientTest) {
+                clientDeadline = snapshot().steady + 10000;
+                SetTimer(main.window, 99, 200, nullptr);
+            }
+            SetTimer(main.window, 1, 1000, nullptr);
             if (!trayStart)
                 ShowWindow(main.window, benchmark ? SW_SHOWNOACTIVATE : SW_SHOWNORMAL);
             if (benchmark)
@@ -283,18 +442,24 @@ class App {
         Shell_NotifyIconW(NIM_DELETE, &n);
     }
     void showMain() {
+        if (remote && !connected)
+            connection.requestStart();
         ShowWindow(main.window, SW_RESTORE);
+        SetWindowPos(main.window, HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW);
         SetForegroundWindow(main.window);
         InvalidateRect(main.window, nullptr, FALSE);
     }
     void trayMenu() {
         HMENU menu = CreatePopupMenu();
         AppendMenuW(menu, MF_STRING, Home, L"打开晚安");
+        if (remote && !connected)
+            AppendMenuW(menu, MF_STRING, StartBackend, L"启动／重连后台");
         AppendMenuW(menu, MF_STRING, PauseAll,
                     engine.state.settings.paused ? L"恢复全部任务" : L"暂停全部任务");
         AppendMenuW(menu, MF_STRING | (engine.active ? 0 : MF_GRAYED), CancelCurrent, L"取消当前倒计时");
         AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
-        AppendMenuW(menu, MF_STRING, Quit, L"退出");
+        AppendMenuW(menu, MF_STRING, StopBackend, L"停止后台并退出");
+        AppendMenuW(menu, MF_STRING, Quit, L"退出界面，后台继续");
         POINT pt;
         GetCursorPos(&pt);
         SetForegroundWindow(main.window);
@@ -307,6 +472,20 @@ class App {
             command(c, main.window);
     }
     void pump(Reconcile reason = Reconcile::Normal) {
+        if (remote) {
+            if (engine.active || IsWindowVisible(main.window))
+                SetTimer(main.window, 1, 1000, nullptr);
+            else
+                KillTimer(main.window, 1);
+            if (connected && !blocked && engine.active)
+                showWarning(false);
+            else if (!preview)
+                hideWarning();
+            if (warning.window)
+                InvalidateRect(warning.window, nullptr, FALSE);
+            InvalidateRect(main.window, nullptr, FALSE);
+            return;
+        }
         KillTimer(main.window, 1);
         if (blocked) {
             InvalidateRect(main.window, nullptr, FALSE);
@@ -434,8 +613,12 @@ class App {
         auto l = calendar.local(t.onceDue);
         t.day = l.day;
         t.minute = l.minute;
-        engine.upsert(t, now);
-        afterMutation();
+        if (remote)
+            sendTask(t);
+        else {
+            engine.upsert(t, now);
+            afterMutation();
+        }
     }
     float editorY(float y) const { return y * std::min(1.f, editor.height() / 570.f); }
     void positionFields() {
@@ -469,6 +652,7 @@ class App {
         }
         auto now = snapshot();
         draft = existing ? *existing : Task{};
+        editingExisting = existing != nullptr;
         if (!existing) {
             draft.id = newId();
             draft.name = countdown ? "倒计时关机" : "每日关机";
@@ -572,6 +756,17 @@ class App {
         return t;
     }
     void command(int id, HWND) {
+        bool localCommand =
+            id == Home || id == Preferences || id == History || id == Quit || id == Preview ||
+            id == DataFolder || id == StartBackend || id == EditorCancel || id == CycleAlert ||
+            id == SnoozeMenu ||
+            (preview && (id == CancelCurrent || id == Snooze10 || id == Snooze30 || id == Snooze60));
+        if (remote && (!connected || setupProcess) && !localCommand) {
+            banner = setupProcess ? L"后台启动设置正在更新，请稍候。"
+                                  : L"后台未连接；请点击重试连接，任务修改暂不可用。";
+            InvalidateRect(main.window, nullptr, FALSE);
+            return;
+        }
         if (id >= 10000) {
             size_t index = (id - 10000) / 10;
             int action = (id - 10000) % 10;
@@ -581,13 +776,22 @@ class App {
             if (action == 0)
                 openEditor(&t);
             else if (action == 1) {
-                engine.enable(t.id, !t.enabled, snapshot());
-                afterMutation();
-            } else if (action == 2) {
-                if (smoke || MessageBoxW(main.window, (L"删除任务“" + wide(t.name) + L"”？").c_str(),
-                                         L"删除任务", MB_YESNO | MB_ICONQUESTION) == IDYES) {
-                    engine.erase(t.id, snapshot());
+                if (remote)
+                    remoteCommand({{"op", "enable"}, {"id", t.id}, {"enabled", !t.enabled}});
+                else {
+                    engine.enable(t.id, !t.enabled, snapshot());
                     afterMutation();
+                }
+            } else if (action == 2) {
+                if (smoke || clientTest ||
+                    MessageBoxW(main.window, (L"删除任务“" + wide(t.name) + L"”？").c_str(), L"删除任务",
+                                MB_YESNO | MB_ICONQUESTION) == IDYES) {
+                    if (remote)
+                        remoteCommand({{"op", "erase"}, {"id", t.id}});
+                    else {
+                        engine.erase(t.id, snapshot());
+                        afterMutation();
+                    }
                 }
             }
             return;
@@ -627,8 +831,12 @@ class App {
                 InvalidateRect(main.window, nullptr, FALSE);
                 break;
             }
-            engine.pause(snapshot(), !engine.state.settings.paused);
-            afterMutation();
+            if (remote)
+                remoteCommand({{"op", "pause"}, {"paused", !engine.state.settings.paused}});
+            else {
+                engine.pause(snapshot(), !engine.state.settings.paused);
+                afterMutation();
+            }
             break;
         case AutoStart: {
             if (simulate) {
@@ -637,6 +845,10 @@ class App {
                 break;
             }
             bool value = !engine.state.settings.autostart;
+            if (remote) {
+                remoteCommand({{"op", "login-start"}, {"enabled", value}});
+                break;
+            }
             std::wstring error;
             if (setAutostart(value, error)) {
                 engine.state.settings.autostart = value;
@@ -647,7 +859,27 @@ class App {
             }
             break;
         }
+        case BackgroundStart:
+            beginBackgroundSetup();
+            break;
+        case StartBackend:
+            operationError.clear();
+            connection.requestStart();
+            banner = L"正在重试连接后台…";
+            InvalidateRect(main.window, nullptr, FALSE);
+            break;
+        case StopBackend:
+            if (remote &&
+                MessageBoxW(main.window, L"停止后台后，当前任务不再执行。下次启动仍可恢复。停止后台并退出？",
+                            L"停止后台", MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2) == IDYES &&
+                remoteCommand({{"op", "stop"}}))
+                command(Quit, main.window);
+            break;
         case Sound:
+            if (remote) {
+                remoteCommand({{"op", "settings"}, {"settings", {{"sound", !engine.state.settings.sound}}}});
+                break;
+            }
             engine.state.settings.sound = !engine.state.settings.sound;
             afterMutation();
             break;
@@ -656,12 +888,24 @@ class App {
                 MessageBoxW(main.window, L"强制关机会关闭应用，未保存的文档可能丢失。\n\n启用强制关机？",
                             L"强制关机", MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) != IDYES)
                 break;
+            if (remote) {
+                remoteCommand({{"op", "settings"}, {"settings", {{"force", !engine.state.settings.force}}}});
+                break;
+            }
             engine.state.settings.force = !engine.state.settings.force;
             afterMutation();
             break;
         case ThemeSystem:
         case ThemeLight:
         case ThemeDark:
+            if (remote) {
+                remoteCommand({{"op", "settings"},
+                               {"settings",
+                                {{"theme", id == ThemeSystem  ? "system"
+                                           : id == ThemeLight ? "light"
+                                                              : "dark"}}}});
+                break;
+            }
             engine.state.settings.theme = id == ThemeSystem ? "system" : id == ThemeLight ? "light" : "dark";
             updateTheme();
             afterMutation();
@@ -673,6 +917,10 @@ class App {
             ShellExecuteW(main.window, L"open", storage.directory.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
             break;
         case RetrySave:
+            if (remote) {
+                remoteCommand({{"op", "retry"}});
+                break;
+            }
             if (save()) {
                 banner = L"设置已保存。检查任务后，可以恢复执行。";
                 pump(Reconcile::Startup);
@@ -681,6 +929,11 @@ class App {
         case CancelCurrent:
             if (preview) {
                 hideWarning();
+                break;
+            }
+            if (remote) {
+                remoteCommand({{"op", "cancel"},
+                               {"keys", engine.active ? engine.active->keys : std::vector<std::string>{}}});
                 break;
             }
             if (engine.cancel(snapshot()))
@@ -705,6 +958,14 @@ class App {
             snoozeKeys.clear();
             if (preview) {
                 hideWarning();
+                break;
+            }
+            if (remote) {
+                remoteCommand({{"op", "snooze"},
+                               {"keys", engine.active ? engine.active->keys : std::vector<std::string>{}},
+                               {"minutes", id == Snooze10   ? 10
+                                           : id == Snooze30 ? 30
+                                                            : 60}});
                 break;
             }
             if (engine.snooze(snapshot(), id == Snooze10 ? 10 : id == Snooze30 ? 30 : 60))
@@ -748,6 +1009,16 @@ class App {
         case EditorCancel:
             closeEditor();
             break;
+        case EditorReload:
+            if (const auto *current = engine.task(draft.id)) {
+                Task copy = *current;
+                closeEditor();
+                openEditor(&copy);
+            } else {
+                closeEditor();
+                banner = L"任务已被删除。";
+            }
+            break;
         case EditorSave: {
             auto t = edited(true);
             if (!t) {
@@ -757,6 +1028,15 @@ class App {
             if (!engine.task(t->id) && engine.state.tasks.size() >= 512) {
                 editorError = L"任务数量已达到上限。";
                 InvalidateRect(editor.window, nullptr, FALSE);
+                break;
+            }
+            if (remote) {
+                if (sendTask(*t, editingExisting))
+                    closeEditor();
+                else {
+                    editorError = banner;
+                    InvalidateRect(editor.window, nullptr, FALSE);
+                }
                 break;
             }
             engine.upsert(*t, snapshot());
@@ -770,6 +1050,12 @@ class App {
             break;
         }
         case Quit:
+            connection.stop();
+            {
+                MSG message{};
+                while (PeekMessageW(&message, main.window, RemoteMessage, RemoteMessage, PM_REMOVE))
+                    delete reinterpret_cast<Json *>(message.lParam);
+            }
             closeEditor();
             hideWarning();
             removeTray();
@@ -798,8 +1084,12 @@ class App {
         float x = w - 133;
         p.fill(rect(x, 30, 104, 28), paused ? 0xE9C776 : dark() ? 0x183D38 : 0xE2F7EF, 14, paused ? .18f : 1);
         p.circle(x + 17, 44, 3.5f, paused ? 0xC59624 : t.good);
-        p.text(paused ? L"已暂停" : L"运行中", rect(x + 28, 30, 66, 28), 12, paused ? 0xBB8A22 : t.good, 500);
-        p.hit(rect(x, 30, 104, 28), PauseAll);
+        bool offline = remote && !connected;
+        p.text(offline  ? L"未连接"
+               : paused ? L"已暂停"
+                        : L"运行中",
+               rect(x + 28, 30, 66, 28), 12, paused ? 0xBB8A22 : t.good, 500);
+        p.hit(rect(x, 30, 104, 28), offline ? StartBackend : PauseAll);
         if (main.focus == PauseAll)
             p.border(rect(x - 2, 28, 108, 32), t.accent, 16, 2);
     }
@@ -827,9 +1117,10 @@ class App {
         }
         p.ring(right, cy, r, fraction, paused ? 0xAFBAD1 : 0x86F2D4, 5);
         if (next) {
-            p.text(engine.active ? L"即将关机"
-                   : paused      ? L"任务已暂停"
-                                 : L"下一次关机",
+            p.text(remote && !connected ? L"上次后台状态（未连接）"
+                   : engine.active      ? L"即将关机"
+                   : paused             ? L"任务已暂停"
+                                        : L"下一次关机",
                    rect(56, heroY + (heroH < 145 ? 12 : 18), w - 310, heroH < 145 ? 18 : 24), 13, 0xE1DFFF,
                    500);
             p.text(formatTime(next->due),
@@ -840,7 +1131,9 @@ class App {
                 secondary += L"  ·  " + wide(task->name);
             p.text(secondary, rect(57, heroBottom - (heroH < 145 ? 25 : 36), w - 308, heroH < 145 ? 18 : 22),
                    12, 0xE4E1FF);
-            std::wstring ringText = paused ? L"等待恢复" : duration(left);
+            std::wstring ringText = remote && !connected ? L"状态待同步"
+                                    : paused             ? L"等待恢复"
+                                                         : duration(left);
             if (compact) {
                 auto pos = ringText.find(L" 小时 ");
                 if (pos != std::wstring::npos)
@@ -935,28 +1228,29 @@ class App {
         p.text(L"习惯，由你决定。", rect(30, 94, w - 60, 38), 27, t.text, 600);
         p.text(L"轻一点的工具，恰到好处的提醒。", rect(32, 135, w - 64, 25), 12, t.muted);
         float top = 177, bottom = h - 30;
-        main.maxScroll = std::max(0.f, 425 - (bottom - top));
+        main.maxScroll = std::max(0.f, 499 - (bottom - top));
         main.scroll = std::clamp(main.scroll, 0.f, main.maxScroll);
         p.clip(rect(24, top, w - 48, std::max(0.f, bottom - top)));
         float y = top - main.scroll;
-        p.fill(rect(28, y, w - 56, 230), t.card, 15);
-        p.border(rect(28, y, w - 56, 230), t.border, 15);
-        std::array<std::wstring, 3> names{L"登录后启动", L"提醒提示音", L"强制关机"};
-        std::array<std::wstring, 3> descriptions{L"开机登录后自动运行到托盘，开始等待任务",
-                                                 L"提前一分钟轻声提醒，为你留出取消的时间",
-                                                 L"默认关闭。启用后，未保存的文档可能丢失"};
-        bool values[] = {engine.state.settings.autostart, engine.state.settings.sound,
-                         engine.state.settings.force};
-        int commands[] = {AutoStart, Sound, Force};
-        for (int i = 0; i < 3; i++) {
+        p.fill(rect(28, y, w - 56, 304), t.card, 15);
+        p.border(rect(28, y, w - 56, 304), t.border, 15);
+        std::array<std::wstring, 4> names{L"未登录也执行任务", L"登录后启动托盘界面", L"提醒提示音",
+                                          L"强制关机"};
+        std::array<std::wstring, 4> descriptions{
+            L"后台开机启动；关闭此项不结束当前后台，设置需要授权", L"登录后连接后台；关闭界面不会停止调度",
+            L"提前一分钟轻声提醒，为你留出取消的时间", L"默认关闭。启用后，未保存的文档可能丢失"};
+        bool values[] = {engine.state.settings.background, engine.state.settings.autostart,
+                         engine.state.settings.sound, engine.state.settings.force};
+        int commands[] = {BackgroundStart, AutoStart, Sound, Force};
+        for (int i = 0; i < 4; i++) {
             float row = y + 12 + i * 74;
             p.text(names[i], rect(49, row, w - 176, 27), 15, t.text, 550);
             p.text(descriptions[i], rect(50, row + 30, w - 180, 22), 11, t.muted);
             p.toggle(rect(w - 95, row + 18, 42, 22), commands[i], values[i]);
-            if (i < 2)
+            if (i < 3)
                 p.line(49, row + 62, w - 50, row + 62, t.border);
         }
-        y += 245;
+        y += 319;
         p.fill(rect(28, y, w - 56, 75), t.card, 14);
         p.border(rect(28, y, w - 56, 75), t.border, 14);
         p.text(L"外观", rect(49, y + 13, 110, 25), 15, t.text, 550);
@@ -974,7 +1268,10 @@ class App {
         p.button(rect(185, y, 126, 35), DataFolder, L"打开数据目录");
         if (blocked)
             p.button(rect(w - 171, y, 143, 35), RetrySave, L"重试保存");
-        p.text(L"晚安 1.0.1 · 离线运行 · 当前用户的数据独立保存", rect(30, y + 49, w - 60, 25), 11, t.muted);
+        else if (remote && !connected)
+            p.button(rect(w - 171, y, 143, 35), StartBackend, L"重试连接后台");
+        p.text(L"晚安 1.1.0 · 界面与后台分离 · 当前用户的数据独立保存", rect(30, y + 49, w - 60, 25), 11,
+               t.muted);
         p.unclip();
     }
     void drawHistory(Painter &p, float w, float h) {
@@ -1081,6 +1378,8 @@ class App {
         p.line(32, fy(515), w - 32, fy(515), t.border);
         p.button(rect(w - 263, fy(529), 103, fy(35)), EditorCancel, L"取消");
         p.button(rect(w - 148, fy(529), 116, fy(35)), EditorSave, L"保存任务", true);
+        if (remote && editingExisting)
+            p.button(rect(32, fy(529), 103, fy(35)), EditorReload, L"重新载入");
     }
     void drawWarning(Painter &p, float w, float h) {
         auto t = p.theme;
@@ -1337,6 +1636,79 @@ class App {
             }
         }
         return false;
+    }
+    void runClientTest() {
+        if (!connected && snapshot().steady < clientDeadline)
+            return;
+        KillTimer(main.window, 99);
+        try {
+            smokeCheck(simulate && remote && connected, "real client connects to simulated backend");
+            Task task;
+            task.id = "client-weekly";
+            task.name = "界面 IPC 周期任务";
+            task.minute = calendar.local(snapshot().wall + 10 * Minute).minute;
+            smokeCheck(sendTask(task), "UI creates backend task");
+            command(10001, main.window);
+            smokeCheck(!engine.task(task.id)->enabled, "UI disables backend task");
+            command(10001, main.window);
+            smokeCheck(engine.task(task.id)->enabled, "UI enables backend task");
+            openEditor(engine.task(task.id));
+            auto rival = encode(engine.state)["tasks"][0];
+            rival["name"] = "后台编辑";
+            auto concurrent = engineRequest(
+                storage.directory,
+                {{"op", "upsert"}, {"task", rival}, {"mustExist", true}, {"version", engine.state.version}});
+            smokeCheck(concurrent.value("ok", false), "concurrent backend edit");
+            command(EditorSave, editor.window);
+            smokeCheck(editor.window && !editorError.empty(), "UI rejects stale editor draft");
+            command(EditorReload, editor.window);
+            smokeCheck(controlText(fields[0]) == L"后台编辑", "UI reloads current task");
+            SetWindowTextW(fields[0], L"中文改名 · 后台持久化");
+            command(EditorSave, editor.window);
+            smokeCheck(!editor.window && engine.task(task.id)->name == utf8(L"中文改名 · 后台持久化"),
+                       "UI editor uses IPC");
+            task.id = "client-countdown";
+            task.name = "界面 IPC 倒计时";
+            task.kind = Kind::Countdown;
+            task.onceDue = snapshot().wall + 50000;
+            smokeCheck(sendTask(task) && engine.active.has_value(), "backend warning reaches UI");
+            auto deadline = engine.active->monotonicDue;
+            auto state = engineRequest(storage.directory, {{"op", "snapshot"}});
+            smokeCheck(state["snapshot"]["groups"][0]["monotonicDue"] == deadline,
+                       "UI keeps backend deadline");
+            command(SnoozeMenu, warning.window);
+            smokeCheck(capture(warning, smokeOutput / L"client-warning.png"), "remote reminder capture");
+            command(Snooze10, warning.window);
+            smokeCheck(!engine.active && std::any_of(engine.state.pending.begin(), engine.state.pending.end(),
+                                                     [](const auto &p) {
+                                                         return p.taskId == "client-countdown" && p.detached;
+                                                     }),
+                       "UI snoozes backend occurrence");
+            command(PauseAll, main.window);
+            smokeCheck(engine.state.settings.paused, "UI pauses backend");
+            command(PauseAll, main.window);
+            smokeCheck(!engine.state.settings.paused, "UI resumes backend");
+            command(ThemeDark, main.window);
+            smokeCheck(engine.state.settings.theme == "dark", "UI settings use IPC");
+            command(History, main.window);
+            smokeCheck(capture(main, smokeOutput / L"client-history.png"), "remote history capture");
+            command(Preferences, main.window);
+            smokeCheck(capture(main, smokeOutput / L"client-settings.png"), "split startup settings capture");
+            command(BackgroundStart, main.window);
+            smokeCheck(!setupProcess, "simulation cannot configure Windows tasks");
+            state = engineRequest(storage.directory, {{"op", "snapshot"}});
+            smokeCheck(state["snapshot"]["state"]["tasks"].size() == 2 &&
+                           state["snapshot"]["simulate"] == true,
+                       "UI mutations exist only in isolated backend");
+            std::ofstream report(smokeOutput / L"client-results.json");
+            report << Json{{"passed", true}, {"simulate", true}, {"checks", smokeChecks}}.dump();
+            report.close();
+        } catch (const std::exception &error) {
+            std::ofstream report(smokeOutput / L"client-results.json");
+            report << Json{{"passed", false}, {"checks", smokeChecks}, {"error", error.what()}}.dump();
+            report.close();
+        }
+        command(Quit, main.window);
     }
     void setupSmoke() {
         engine.state = State{};
@@ -1728,8 +2100,18 @@ static LRESULT CALLBACK windowProcedure(HWND window, UINT message, WPARAM wParam
         } else if (!wParam)
             s->discard();
         break;
+    case RemoteMessage:
+        if (s == &app.main) {
+            std::unique_ptr<Json> packet(reinterpret_cast<Json *>(lParam));
+            app.receive(*packet);
+        }
+        return 0;
     case WM_TIMER:
         if (s == &app.main) {
+            if (wParam == 5) {
+                app.pollBackgroundSetup();
+                return 0;
+            }
             if (wParam == 1)
                 app.pump();
             else if (wParam == 2 && IsWindowVisible(window))
@@ -1739,8 +2121,15 @@ static LRESULT CALLBACK windowProcedure(HWND window, UINT message, WPARAM wParam
                     app.hideWarning();
                 else if (app.warning.window)
                     InvalidateRect(app.warning.window, nullptr, FALSE);
-            } else if (wParam == 99)
-                app.runSmoke();
+            } else if (wParam == 99) {
+                if (app.clientTest)
+                    app.runClientTest();
+                else
+                    app.runSmoke();
+            } else if (wParam == 98) {
+                KillTimer(window, 98);
+                ShowWindow(window, SW_HIDE);
+            }
         } else if (s == &app.warning && wParam == 4) {
             app.warningProgress = std::min(1.f, float(snapshot().steady - app.warningAnimation) / 180.f);
             app.placeWarning();
@@ -1808,11 +2197,25 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
     InitCommonControlsEx(&controls);
     int argc = 0;
     LPWSTR *argv = CommandLineToArgvW(GetCommandLineW(), &argc);
-    bool simulate = false, tray = false, smoke = false, benchmark = false, explicitData = false;
+    bool simulate = false, tray = false, smoke = false, clientTest = false, benchmark = false,
+         explicitData = false, engineMode = false;
+    std::wstring setupMode, expectedOwner;
+    std::filesystem::path resultPath;
     std::filesystem::path data = defaultDataDirectory(), output;
     for (int i = 1; i < argc; i++) {
         std::wstring a = argv[i];
-        if (a == L"--simulate")
+        if (a == L"--engine")
+            engineMode = true;
+        else if (a == L"--ui") {
+        } else if ((a == L"--setup-background" || a == L"--owner-sid" || a == L"--result") && i + 1 < argc) {
+            auto value = std::wstring(argv[++i]);
+            if (a == L"--setup-background")
+                setupMode = value;
+            else if (a == L"--owner-sid")
+                expectedOwner = value;
+            else
+                resultPath = value;
+        } else if (a == L"--simulate")
             simulate = true;
         else if (a == L"--tray")
             tray = true;
@@ -1828,6 +2231,13 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
             }
             data = argv[++i];
             explicitData = true;
+        } else if (a == L"--client-test" && i + 1 < argc) {
+            clientTest = true;
+            simulate = true;
+            output = std::filesystem::absolute(argv[++i]);
+            std::filesystem::create_directories(output);
+            data = output / L"data";
+            explicitData = true;
         } else if (a == L"--smoke-test") {
             if (i + 1 >= argc) {
                 LocalFree(argv);
@@ -1842,9 +2252,51 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
         }
     }
     LocalFree(argv);
-    if (simulate && !explicitData && !smoke)
+    if (smoke || clientTest) {
+        simulate = true;
+        data = output / L"data";
+        explicitData = true;
+        if (engineMode || !setupMode.empty()) {
+            if (SUCCEEDED(initialized))
+                CoUninitialize();
+            return 2;
+        }
+    }
+    if (simulate && !explicitData)
         data = defaultDataDirectory() / L"Simulation";
+    if (simulate && runtimeIdentity(data) == runtimeIdentity(defaultDataDirectory())) {
+        if (SUCCEEDED(initialized))
+            CoUninitialize();
+        return 2;
+    }
     data = std::filesystem::absolute(data).lexically_normal();
+    if (engineMode || !setupMode.empty()) {
+        int result = 2;
+        Json outcome;
+        try {
+            if (!expectedOwner.empty() && expectedOwner != ownerSid())
+                throw std::runtime_error("管理员账户与所属账户不同，未修改启动设置");
+            if (engineMode && !setupMode.empty())
+                throw std::runtime_error("后台入口参数冲突");
+            if (engineMode)
+                result = runEngine(data, simulate);
+            else {
+                if (setupMode != L"on" && setupMode != L"off")
+                    throw std::runtime_error("后台设置参数无效");
+                outcome = configureBackground(data, setupMode == L"on", simulate);
+                result = outcome.value("ok", false) ? 0 : 2;
+            }
+        } catch (const std::exception &error) {
+            outcome = {{"ok", false}, {"error", error.what()}};
+        }
+        if (!resultPath.empty()) {
+            std::ofstream output(resultPath);
+            output << outcome.dump();
+        }
+        if (SUCCEEDED(initialized))
+            CoUninitialize();
+        return result;
+    }
     int result = 0;
     {
         App app(instance, data);
@@ -1853,6 +2305,8 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
         app.benchmark = benchmark;
         app.trayStart = tray;
         app.smoke = smoke;
+        app.clientTest = clientTest;
+        app.remote = !smoke;
         app.smokeOutput = output;
         if (app.initialize()) {
             MSG m{};

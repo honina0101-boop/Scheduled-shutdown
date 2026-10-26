@@ -1,4 +1,5 @@
 #pragma once
+#include "../third_party/json.hpp"
 #include "core.hpp"
 #ifndef NOMINMAX
 #define NOMINMAX
@@ -7,6 +8,8 @@
 #include <windows.h>
 
 namespace evening {
+nlohmann::json encode(const State &state);
+State decode(const nlohmann::json &value);
 struct WindowsCalendar : Calendar {
     // Optional injected zone for deterministic tests; the app uses the current Windows zone.
     std::optional<DYNAMIC_TIME_ZONE_INFORMATION> zoneOverride;

@@ -14,7 +14,7 @@ import zipfile
 
 ROOT = Path(__file__).resolve().parents[1]
 REPOSITORY = "honina0101-boop/Scheduled-shutdown"
-VERSION = "1.0.1"
+VERSION = "1.1.0"
 TAG = "v" + VERSION
 API = "https://api.github.com/repos/" + REPOSITORY
 
@@ -23,7 +23,7 @@ def digest(path):
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-def prepare(directory="dist"):
+def prepare(directory="dist", candidate=False):
     dist = ROOT / directory
     checks = json.loads((dist / "CHECKSUMS.json").read_text(encoding="utf-8"))
     for name, item in checks.items():
@@ -34,7 +34,7 @@ def prepare(directory="dist"):
     if executable.stat().st_size > 5_000_000:
         raise RuntimeError("EXE exceeds the 5 MB budget")
     report = ROOT / "build/qa/report.json"
-    if report.exists():
+    if report.exists() and not candidate:
         verified = json.loads(report.read_text(encoding="utf-8"))
         if verified["binary_sha256"] != digest(executable):
             raise RuntimeError("EXE differs from the verified binary")
@@ -86,39 +86,40 @@ def request(token, method, url, value=None, raw=None, content_type=None):
         return json.load(response)
 
 
-def publish(assets, target):
+def publish(assets, target, candidate=False):
     token = credential()
-    report = json.loads((ROOT / "build/qa/report.json").read_text(encoding="utf-8"))
-    total = report["scheduler"]["assertions"] + report["persistence_platform"]["assertions"] + report["ui"]["checks"] + report["instance_lock"]["checks"]
+    if candidate:
+        validation = "按用户要求停止最终功能验证，直接提供自测包。此版本标记为预发布，待用户验证；此前构建的测试结果不作为本包验收结果。"
+    else:
+        report = json.loads((ROOT / "build/qa/report.json").read_text(encoding="utf-8"))
+        total = report["scheduler"]["assertions"] + report["persistence_platform"]["assertions"] + report["ui"]["checks"] + report["instance_lock"]["checks"] + report["ipc"]["checks"] + report["remote_ui"]["checks"]
+        validation = str(total) + " 项隔离模拟检查通过；真实未登录关机仍须专用环境验收。"
     body = r"""## 下载与使用
 
-推荐下载 **Evenfall-1.0.1-win-x64.zip**，解压后双击 **Evenfall.exe**。免安装，无需另装运行库，适用于 Windows 10/11 64 位。
+下载 **Evenfall-1.1.0-win-x64.zip**，解压后双击 **Evenfall.exe**。单 EXE 小于 5 MB，Windows 10/11 64 位，无需另装运行库。
 
-也可以直接下载 **Evenfall.exe**（小于 5 MB）。第一次运行没有预置任务，请自行创建。
+## 1.1.0：后台调度与界面分离
 
-GitHub 自动附带的 Source code (zip / tar.gz) 是源码，不是可运行程序。
+- 设置“未登录也执行任务”后，使用当前账户的免保存密码 S4U 计划任务运行唯一后台；登录后托盘界面连接它。
+- 两个独立启动开关；关闭界面不停止调度。托盘可选择“退出界面，后台继续”或“停止后台并退出”。
+- 登录、解锁、重新打开界面不会重新安排倒计时。未登录时无法显示可操作桌面提醒，但后台仍按计划执行。
+- 本地命名管道限制账户身份并拒绝远程访问，后台独占数据、保存成功再确认；过期命令和过期编辑草稿被拒绝。
+- 保留午夜双时钟保护、持续停用、取消本次、卡片内推迟选项和执行记录。
 
-## 1.0.1 修复
+## 设置与升级
 
-- 关机请求同时检查倒计时与系统时间，避免午夜前几毫秒提前提交；正常提醒保持原定时间。
-- 记录区区分原计划、本次目标、实际请求时间（到秒）；保留旧日志原始事实。
-- 停用持续有效，清除提醒和推迟项；提交前复核启用状态、任务版本、存在性及暂停状态。补充开关操作记录，并防止旧编辑草稿重新启用任务。
-- 数据目录采用跨会话独占文件锁，阻止计划任务后台副本与桌面副本同时调度；锁定失败时不启动调度。
-- 推迟 10／30／60 分钟选项在提醒卡片内部展开，支持 Tab、Enter、Esc，消除独立弹出菜单被遮挡的路径。
-- 新增开发交接记录及午夜、停用、旧数据迁移回归测试。
+EXE 放在固定、本地、未加密目录。开启“未登录也执行任务”可能需要管理员授权；软件不获取或保存 Windows 登录密码。S4U 受账户批处理登录、关机权限及系统策略限制，不能访问网络或加密文件。设置失败明确报错，不改用 SYSTEM。
 
-本机已发现后台会话与桌面会话重复运行条件；旧版会话内互斥量无法拦截。历史日志没有进程标识，无法追溯哪一个副本提交了某次请求。菜单遮挡的原始操作路径未复现，本次移除了独立弹出菜单。
+升级前退出所有旧副本并备份配置及旧 EXE。新版本读取旧数据、保存为 schemaVersion 3；回退旧版须先停止并停用新版后台，再恢复升级前备份。不要再另设运行普通界面的非交互式计划任务，使用程序管理的后台入口。
 
-## 升级
+## 验证边界
 
-先停止运行旧版的 Windows 计划任务并从托盘退出旧版，确认所有旧进程退出后复制备份 `%LOCALAPPDATA%\Evenfall`，再替换 EXE。新版读取旧数据并保存为 schemaVersion 2；回退 1.0.0 时须恢复升级前备份。建议仅使用程序内的登录自启动，避免另设非交互式计划任务；新版与旧版混用时，旧版不会遵守新增文件锁。取消本次不等于停用：前一天 23:59 取消紧接着的 00:00 后，再下一天 00:00 继续。
+{validation}
 
-## 验证
+未登录冷启动、真实关机、Windows 11、多物理显示器、真实注销／睡眠恢复等仍需专用环境验收；不会把模拟结果称为真实未登录关机通过。本版本未签名。
 
-{total} 项模拟检查通过。Windows 10 已完成本地验证；实际关机、Windows 11、真实登录启动、睡眠恢复和多个物理显示器尚待专用环境验证。本版本未做代码签名。
-
-校验值见 SHA256SUMS.txt；使用说明和许可证包含在推荐的便携 ZIP 中。
-""".replace("{total}", str(total))
+使用说明及许可证包含在便携包中；校验值见 SHA256SUMS.txt，开发记录及验证详情见源码 docs。
+""".replace("{validation}", validation)
     try:
         release = request(token, "GET", API + "/releases/tags/" + TAG)
     except urllib.error.HTTPError as error:
@@ -127,7 +128,9 @@ GitHub 自动附带的 Source code (zip / tar.gz) 是源码，不是可运行程
         release = request(token, "POST", API + "/releases",
                           {"tag_name": TAG, "target_commitish": target,
                            "name": "晚安 · 定时关机 " + VERSION,
-                           "body": body, "draft": True, "prerelease": False})
+                           "body": body, "draft": True, "prerelease": candidate})
+    if not release["draft"] and release["prerelease"] != candidate:
+        raise RuntimeError("Existing release verification status differs; refusing to change it")
     upload = release["upload_url"].split("{", 1)[0]
     existing = {asset["name"]: asset for asset in release["assets"]}
     for file in assets:
@@ -149,23 +152,24 @@ GitHub 自动附带的 Source code (zip / tar.gz) 是源码，不是可运行程
             raise RuntimeError("Uploaded asset digest mismatch: " + file.name)
         print("Uploaded: " + file.name, flush=True)
     release = request(token, "PATCH", API + "/releases/" + str(release["id"]),
-                      {"draft": False, "body": body})
+                      {"draft": False, "body": body, "prerelease": candidate, "make_latest": "false" if candidate else "true"})
     print("Published: " + release["html_url"], flush=True)
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--prepare-only", action="store_true")
+    parser.add_argument("--candidate", action="store_true", help="Explicitly publish an unverified prerelease for user acceptance")
     parser.add_argument("--dist-dir", default="dist")
     parser.add_argument("--target-sha", help="Full verified commit SHA for the release tag")
     args = parser.parse_args()
     try:
-        assets = prepare(args.dist_dir)
+        assets = prepare(args.dist_dir, args.candidate)
         if args.prepare_only:
             print("Verified release assets: " + ", ".join(file.name for file in assets))
         else:
             if not args.target_sha or not re.fullmatch(r"[0-9a-f]{40}", args.target_sha):
                 raise RuntimeError("--target-sha must be a full verified commit SHA")
-            publish(assets, args.target_sha)
+            publish(assets, args.target_sha, args.candidate)
     except (RuntimeError, urllib.error.URLError, subprocess.TimeoutExpired) as error:
         raise SystemExit("Release failed: " + str(error))
